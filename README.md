@@ -1,6 +1,6 @@
 # HydroChess WASM
 
-A Rust-based chess engine compiled to WebAssembly for infinite chess variants.
+A Rust-based chess engine compiled to WebAssembly for infinite chess variants. tsevasa fork
 
 ## Features
 
