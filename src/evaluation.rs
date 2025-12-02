@@ -2,6 +2,7 @@ use crate::board::{Board, Coordinate, PieceType, PlayerColor};
 use crate::game::GameState;
 #[cfg(feature = "eval_tuning")]
 use once_cell::sync::Lazy;
+#[cfg(feature = "eval_tuning")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "eval_tuning")]
 use std::sync::RwLock;
@@ -10,19 +11,9 @@ use std::sync::RwLock;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EvalFeatures {
     // King safety
-    pub king_ring_pawn_bonus: i32,
     pub king_ring_missing_penalty: i32,
     pub king_open_ray_penalty: i32,
     pub king_enemy_slider_penalty: i32,
-    pub knight_near_king_bonus: i32,
-    pub king_front_shield_bonus: i32,
-    pub king_knight_shield_bonus: i32,
-
-    // "Behind king" / tropism tuning
-    pub rook_behind_king_bonus: i32,
-    pub queen_behind_king_bonus: i32,
-    pub bishop_behind_king_bonus: i32,
-    pub king_tropism_bonus: i32,
 
     // Development & piece order
     pub dev_queen_back_rank_penalty: i32,
@@ -30,20 +21,14 @@ pub struct EvalFeatures {
     pub dev_minor_back_rank_penalty: i32,
 
     // Rook activity
-    pub rook_open_file_bonus: i32,
-    pub rook_semi_open_bonus: i32,
-    pub rook_far_attack_bonus: i32,
     pub rook_idle_penalty: i32,
-    pub rook_near_enemy_file_bonus: i32,
 
     // Slider mobility
     pub slider_mobility_bonus: i32,
     pub bishop_mobility_bonus: i32,
 
     // Pawn structure
-    pub passed_pawn_bonus: i32,
     pub doubled_pawn_penalty: i32,
-    pub isolated_pawn_penalty: i32,
 
     // Bishop pair & queen heuristics
     pub bishop_pair_bonus: i32,
@@ -89,7 +74,7 @@ pub fn get_piece_value(piece_type: PieceType) -> i32 {
         PieceType::Void => 0,
         PieceType::Obstacle => 0,
 
-        // orthodox - adjusted for infinite chess where sliders dominate
+        // orthodox - adjusted for infinite chess where sliders dominate (baseline scale)
         PieceType::Pawn => 100,
         PieceType::Knight => 250, // Weak in infinite chess - limited range
         PieceType::Bishop => 450, // Strong slider - worth knight + 1.5 pawns
@@ -126,39 +111,45 @@ pub fn get_piece_value(piece_type: PieceType) -> i32 {
 const WHITE_BACK_RANK: i64 = 1;
 const BLACK_BACK_RANK: i64 = 8;
 
-const KING_RING_PAWN_BONUS: i32 = 30;
-const KING_RING_MISSING_PENALTY: i32 = 50;
-const KING_OPEN_RAY_PENALTY: i32 = 10;
-const KING_ENEMY_SLIDER_PENALTY: i32 = 35;
-const KNIGHT_NEAR_KING_BONUS: i32 = 16;
-const KING_FRONT_SHIELD_BONUS: i32 = 18;
-const KING_KNIGHT_SHIELD_BONUS: i32 = 14;
-
-const ROOK_BEHIND_KING_BONUS: i32 = 22;
-const QUEEN_BEHIND_KING_BONUS: i32 = 30;
-const BISHOP_BEHIND_KING_BONUS: i32 = 14;
-const KING_TROPISM_BONUS: i32 = 5;
-
 const DEV_QUEEN_BACK_RANK_PENALTY: i32 = 40;
 const DEV_ROOK_BACK_RANK_PENALTY: i32 = 18;
 const DEV_MINOR_BACK_RANK_PENALTY: i32 = 10;
 
-const ROOK_OPEN_FILE_BONUS: i32 = 30;
-const ROOK_SEMI_OPEN_BONUS: i32 = 20;
-const ROOK_FAR_ATTACK_BONUS: i32 = 8;
+// Rook heuristics
 const ROOK_IDLE_PENALTY: i32 = 12;
-const ROOK_NEAR_ENEMY_FILE_BONUS: i32 = 8;
 
-const SLIDER_MOBILITY_BONUS: i32 = 3;
-const BISHOP_MOBILITY_BONUS: i32 = 3;
+// King attack heuristics - back near original scale
+// These should be impactful but not dominate material.
+const BEHIND_KING_BONUS: i32 = 40;
+const KING_TROPISM_BONUS: i32 = 4;
+const KNIGHT_NEAR_KING_BONUS: i32 = 15;
+const SLIDER_NET_BONUS: i32 = 20;
 
-const PASSED_PAWN_BONUS: i32 = 10;
+// King safety ring and ray penalties - slightly stronger than original
+const KING_RING_MISSING_PENALTY: i32 = 30;
+const KING_OPEN_RAY_PENALTY: i32 = 10;
+const KING_ENEMY_SLIDER_PENALTY: i32 = 15;
+
+// King pawn shield heuristics (mild influence only)
+// Reward having pawns in front of the king and penalize the king walking
+// in front of its pawn chain.
+const KING_PAWN_SHIELD_BONUS: i32 = 10;
+const KING_PAWN_AHEAD_PENALTY: i32 = 20;
+
+// Mobility tuning (kept modest so pieces don't run to infinity for raw space)
+const SLIDER_MOBILITY_BONUS: i32 = 1; // Used only for queen/bishop mobility
+const BISHOP_MOBILITY_BONUS: i32 = 1;
+
+// Distance penalties to discourage sliders far away from the enemy king
+const FAR_SLIDER_CHEB_RADIUS: i64 = 20;
+const FAR_QUEEN_PENALTY: i32 = 2;
+const FAR_BISHOP_PENALTY: i32 = 1;
+
+// Pawn structure
 const DOUBLED_PAWN_PENALTY: i32 = 8;
-const ISOLATED_PAWN_PENALTY: i32 = 6;
 
+// Bishop pair & queen heuristics
 const BISHOP_PAIR_BONUS: i32 = 60;
-const QUEEN_TOO_CLOSE_TO_KING_PENALTY: i32 = 40;
-const QUEEN_FORK_ZONE_BONUS: i32 = 18;
 const QUEEN_IDEAL_LINE_DIST: i32 = 4;
 
 // ==================== Main Evaluation ====================
@@ -335,83 +326,69 @@ fn evaluate_rook(
 ) -> i32 {
     let mut bonus: i32 = 0;
 
-    // Aggressive rook: reward clear lines towards the enemy king from a distance.
+    // Behind enemy king bonus and rook tropism.
     let enemy_king = if color == PlayerColor::White {
         black_king
     } else {
         white_king
     };
-    let mut aligned_with_king = false;
     if let Some(ek) = enemy_king {
-        let same_file = x == ek.x;
-        let same_rank = y == ek.y;
-        aligned_with_king = same_file || same_rank;
+        // Behind enemy king along the rank direction.
+        if (color == PlayerColor::White && y > ek.y) || (color == PlayerColor::Black && y < ek.y) {
+            bonus += BEHIND_KING_BONUS;
+        }
 
-        if aligned_with_king {
-            let from = Coordinate { x, y };
-            // Only reward if the line between rook and king is not blocked.
-            if is_clear_line_between(&game.board, &from, ek) {
-                // Base line-attack bonus towards enemy king.
-                bonus += ROOK_OPEN_FILE_BONUS;
-                bump_feat!(rook_open_file_bonus, 1);
+        // On same or adjacent file to enemy king: strong attacking potential.
+        if (x - ek.x).abs() <= 1 {
+            bonus += 50;
+        }
 
-                // Distance factor: rooks like working from a distance on open lines.
-                let lin_dist = if same_file {
-                    (y - ek.y).abs()
-                } else {
-                    (x - ek.x).abs()
-                } as i32;
-                let capped = lin_dist.min(24);
-                let far_coeff = ROOK_FAR_ATTACK_BONUS.max(1);
-                bonus += capped * far_coeff;
-                bump_feat!(rook_far_attack_bonus, capped);
+        // Rook tropism: closer to enemy king is better, but capped.
+        let dist = (x - ek.x).abs() + (y - ek.y).abs();
+        let capped = dist.min(25);
+        let trop = (25 - capped) as i32;
+        bonus += trop * KING_TROPISM_BONUS;
 
-                // Additional "behind king" encouragement if we are past the king's rank.
-                if (color == PlayerColor::White && y > ek.y)
-                    || (color == PlayerColor::Black && y < ek.y)
-                {
-                    bonus += ROOK_BEHIND_KING_BONUS;
-                    bump_feat!(rook_behind_king_bonus, 1);
-                }
+        // Simplified confinement bonus - just reward rooks controlling key squares near king
+        // Much faster than the previous complex detection
+        let mut confinement_bonus = 0;
+
+        // Rook on same rank as king - controls king's horizontal movement
+        if y == ek.y {
+            if (x - ek.x).abs() <= 3 {
+                confinement_bonus += 30;
             }
-        } else {
-            // Non-aligned rooks get a modest tropism bonus so they aim towards the enemy king.
-            let dist = (x - ek.x).abs() + (y - ek.y).abs();
-            let trop = ((20 - dist.min(20)) as i32) / 4;
-            bonus += trop * KING_TROPISM_BONUS;
-            bump_feat!(king_tropism_bonus, trop);
         }
 
-        // Prefer files close to the enemy king's file even when not perfectly aligned.
-        let file_dist = (x - ek.x).abs() as i32;
-        if file_dist <= 2 {
-            let weight = 3 - file_dist;
-            bonus += ROOK_NEAR_ENEMY_FILE_BONUS * weight;
-            bump_feat!(rook_near_enemy_file_bonus, weight);
+        // Rook on same file as king - controls king's vertical movement
+        if x == ek.x {
+            if (y - ek.y).abs() <= 3 {
+                confinement_bonus += 30;
+            }
         }
+
+        // Rook adjacent to king - immediate pressure
+        if (x - ek.x).abs() <= 1 && (y - ek.y).abs() <= 1 {
+            confinement_bonus += 40;
+        }
+
+        bonus += confinement_bonus;
+
+        // Simplified slider coordination - just count nearby sliders without iteration
+        // Much faster than previous full board scan
+        let nearby_slider_bonus = if (x - ek.x).abs() <= 4 && (y - ek.y).abs() <= 4 {
+            // This rook is close to king, assume some coordination exists
+            SLIDER_NET_BONUS / 2
+        } else {
+            0
+        };
+
+        bonus += nearby_slider_bonus;
     }
 
-    // Classic rook behaviour: open/semi-open files still matter.
+    // Penalize completely idle rooks stuck behind both own and enemy pawns on their file.
     let (own_pawns_on_file, enemy_pawns_on_file) = count_pawns_on_file(game, x, color);
-    if own_pawns_on_file == 0 {
-        if enemy_pawns_on_file == 0 {
-            bonus += ROOK_OPEN_FILE_BONUS;
-            bump_feat!(rook_open_file_bonus, 1);
-        } else {
-            bonus += ROOK_SEMI_OPEN_BONUS;
-            bump_feat!(rook_semi_open_bonus, 1);
-        }
-    }
-
-    // General rook mobility: rooks should control many squares from afar.
-    let rook_dirs: &[(i64, i64)] = &[(1, 0), (-1, 0), (0, 1), (0, -1)];
-    let mobility = slider_mobility(&game.board, x, y, rook_dirs, 12);
-    bonus += mobility * SLIDER_MOBILITY_BONUS;
-    bump_feat!(slider_mobility_bonus, mobility);
-
-    // Penalize completely idle rooks stuck behind both own and enemy pawns
-    // on their file and not meaningfully aligned with the enemy king.
-    if own_pawns_on_file > 0 && enemy_pawns_on_file > 0 && !aligned_with_king {
+    if own_pawns_on_file > 0 && enemy_pawns_on_file > 0 {
         bonus -= ROOK_IDLE_PENALTY;
         bump_feat!(rook_idle_penalty, -1);
     }
@@ -448,9 +425,7 @@ fn evaluate_queen(
             // Reward only if the line is clear between queen and king (direct pressure).
             if is_clear_line_between(&game.board, &from, ek) {
                 // Base line-attack bonus for directly targeting the king.
-                let mut line_bonus: i32 = QUEEN_BEHIND_KING_BONUS;
-                bump_feat!(queen_behind_king_bonus, 1);
-
+                let mut line_bonus: i32 = 30;
                 // Distance sweet spot along the checking line: prefer being around
                 // QUEEN_IDEAL_LINE_DIST squares away from the king rather than too close.
                 let lin_dist = dx.abs().max(dy.abs()) as i32;
@@ -459,7 +434,6 @@ fn evaluate_queen(
                 let diff = (clamped - QUEEN_IDEAL_LINE_DIST).abs();
                 let base = (max_lin - diff * 2).max(0); // sharp peak around the ideal distance
                 let distance_score = base * KING_TROPISM_BONUS.max(1);
-                bump_feat!(king_tropism_bonus, base);
 
                 line_bonus += distance_score;
                 bonus += line_bonus;
@@ -468,37 +442,44 @@ fn evaluate_queen(
                 if (color == PlayerColor::White && y > ek.y)
                     || (color == PlayerColor::Black && y < ek.y)
                 {
-                    bonus += QUEEN_BEHIND_KING_BONUS;
-                    bump_feat!(queen_behind_king_bonus, 1);
+                    bonus += 30;
                 }
             }
         }
 
-        // Penalize being too close to the enemy king (easy to attack, no room to fork),
-        // then give a strong fork-zone bonus centered around QUEEN_IDEAL_LINE_DIST.
-        let chebyshev = dx.abs().max(dy.abs());
-        if chebyshev <= 1 {
-            bonus -= QUEEN_TOO_CLOSE_TO_KING_PENALTY;
-            bump_feat!(queen_too_close_to_king_penalty, -1);
-        } else if chebyshev >= 3 && chebyshev <= 10 {
-            let diff = (chebyshev as i32 - QUEEN_IDEAL_LINE_DIST).abs();
-            let scale = (10 - diff).max(1);
-            bonus += QUEEN_FORK_ZONE_BONUS * scale;
-            bump_feat!(queen_fork_zone_bonus, scale);
-        }
-
-        // General king tropism even when not perfectly aligned:
-        // slightly prefer being closer, but with lower weight so the line-distance
-        // and fork-zone heuristics dominate.
+        // General tropism bonus based on Manhattan distance (king proximity).
         let dist = (x - ek.x).abs() + (y - ek.y).abs();
         let manhattan_score = (20 - dist.min(20)) as i32;
         let manhattan_weight = (KING_TROPISM_BONUS / 2).max(1);
         bonus += manhattan_score * manhattan_weight;
-        bump_feat!(king_tropism_bonus, manhattan_score / 2);
+
+        // Penalize queens that are extremely far from the enemy king.
+        let cheb = (x - ek.x).abs().max((y - ek.y).abs());
+        if cheb > FAR_SLIDER_CHEB_RADIUS {
+            let excess = (cheb - FAR_SLIDER_CHEB_RADIUS).min(32) as i32;
+            bonus -= excess * FAR_QUEEN_PENALTY;
+        }
     }
 
-    // Queen mobility: prefers long-range control in all directions.
-    let queen_dirs: &[(i64, i64)] = &[
+    // Queen mobility
+    // Directional: we mostly care about mobility towards the enemy side and
+    // along central files/ranks, not running off to infinity behind our own
+    // king.
+    let queen_dirs_white: &[(i64, i64)] = &[
+        (1, 0),  // horizontal
+        (-1, 0), // horizontal
+        (0, 1),  // forward (towards black)
+        (1, 1),  // forward diagonals
+        (-1, 1),
+    ];
+    let queen_dirs_black: &[(i64, i64)] = &[
+        (1, 0),  // horizontal
+        (-1, 0), // horizontal
+        (0, -1), // forward (towards white)
+        (1, -1), // forward diagonals
+        (-1, -1),
+    ];
+    let queen_dirs_neutral: &[(i64, i64)] = &[
         (1, 0),
         (-1, 0),
         (0, 1),
@@ -508,6 +489,13 @@ fn evaluate_queen(
         (-1, 1),
         (-1, -1),
     ];
+
+    let queen_dirs: &[(i64, i64)] = match color {
+        PlayerColor::White => queen_dirs_white,
+        PlayerColor::Black => queen_dirs_black,
+        PlayerColor::Neutral => queen_dirs_neutral,
+    };
+
     let mobility = slider_mobility(&game.board, x, y, queen_dirs, 12);
     bonus += mobility * SLIDER_MOBILITY_BONUS;
     bump_feat!(slider_mobility_bonus, mobility);
@@ -524,8 +512,9 @@ fn evaluate_knight(
 ) -> i32 {
     let mut bonus: i32 = 0;
 
-    // Knights are weak in infinite chess - minimal positional bonus
-    // Small bonus for being near friendly king (defensive)
+    // Knights are weak in infinite chess overall, but we still reward good king-related placement.
+
+    // Small bonus for being near friendly king (defensive knight).
     let own_king = if color == PlayerColor::White {
         white_king
     } else {
@@ -534,15 +523,13 @@ fn evaluate_knight(
     if let Some(ok) = own_king {
         let dist = (x - ok.x).abs() + (y - ok.y).abs();
         if dist <= 3 {
-            bonus += KNIGHT_NEAR_KING_BONUS; // Knight protecting king
-            bump_feat!(knight_near_king_bonus, 1);
+            bonus += KNIGHT_NEAR_KING_BONUS;
         } else if dist <= 5 {
             bonus += KNIGHT_NEAR_KING_BONUS / 2;
-            bump_feat!(knight_near_king_bonus, 1);
         }
     }
 
-    // Small bonus for being near enemy king (fork potential)
+    // Small bonus for being near enemy king (fork and mating net potential).
     let enemy_king = if color == PlayerColor::White {
         black_king
     } else {
@@ -551,8 +538,13 @@ fn evaluate_knight(
     if let Some(ek) = enemy_king {
         let dist = (x - ek.x).abs() + (y - ek.y).abs();
         if dist <= 3 {
-            bonus += 10; // Fork potential
+            bonus += 10;
         }
+    }
+
+    // Mild centralization bonus.
+    if x >= 3 && x <= 5 && y >= 3 && y <= 5 {
+        bonus += 5;
     }
 
     bonus
@@ -568,52 +560,59 @@ fn evaluate_bishop(
 ) -> i32 {
     let mut bonus: i32 = 0;
 
-    // Bishop mobility along diagonals – bishops should control long diagonals.
-    let bishop_dirs: &[(i64, i64)] = &[(1, 1), (1, -1), (-1, 1), (-1, -1)];
-    let mobility = slider_mobility(&game.board, x, y, bishop_dirs, 12);
-    bonus += mobility * BISHOP_MOBILITY_BONUS;
-    bump_feat!(bishop_mobility_bonus, mobility);
-
-    // Long diagonal control bonus (approximate "main diagonals" notion)
+    // Long diagonal control bonus: bishops near "main" diagonals get a small bonus.
     if (x - y).abs() <= 1 || (x + y - 8).abs() <= 1 {
         bonus += 8;
     }
 
-    // Behind enemy king bonus - bishop past enemy king for attack
+    // Behind enemy king bonus and bishop tropism.
     let enemy_king = if color == PlayerColor::White {
         black_king
     } else {
         white_king
     };
     if let Some(ek) = enemy_king {
-        if color == PlayerColor::White && y > ek.y {
-            bonus += BISHOP_BEHIND_KING_BONUS;
-            bump_feat!(bishop_behind_king_bonus, 1);
-        } else if color == PlayerColor::Black && y < ek.y {
-            bonus += BISHOP_BEHIND_KING_BONUS;
-            bump_feat!(bishop_behind_king_bonus, 1);
+        // Bishop behind enemy king along the rank direction (less direct than rook/queen).
+        if (color == PlayerColor::White && y > ek.y) || (color == PlayerColor::Black && y < ek.y) {
+            bonus += BEHIND_KING_BONUS / 2;
         }
-        // King tropism
-        let dist = (x - ek.x).abs() + (y - ek.y).abs();
-        let trop = ((15 - dist.min(15)) as i32) / 2;
-        bonus += trop * KING_TROPISM_BONUS;
-        bump_feat!(king_tropism_bonus, trop);
 
-        // Direct diagonal pressure towards the enemy king, even from afar.
-        let dx = ek.x - x;
-        let dy = ek.y - y;
-        if dx.abs() == dy.abs() {
-            let lin_dist = dx.abs() as i32;
-            let capped = lin_dist.min(24);
-            bonus += capped * KING_TROPISM_BONUS;
-            bump_feat!(king_tropism_bonus, capped);
+        // Bishop tropism: closer diagonally to enemy king is good.
+        let dist = (x - ek.x).abs() + (y - ek.y).abs();
+        let capped = dist.min(15);
+        let trop = (15 - capped) as i32;
+        bonus += trop * (KING_TROPISM_BONUS / 2).max(1);
+
+        // Penalize bishops that are extremely far from the enemy king.
+        let cheb = (x - ek.x).abs().max((y - ek.y).abs());
+        if cheb > FAR_SLIDER_CHEB_RADIUS {
+            let excess = (cheb - FAR_SLIDER_CHEB_RADIUS).min(32) as i32;
+            bonus -= excess * FAR_BISHOP_PENALTY;
         }
     }
+
+    // Bishop mobility: prefer activity on diagonals pointing towards the
+    // enemy side. Backward diagonals are mostly defensive and should not
+    // encourage bishops to run off to infinity behind our own king.
+    let bishop_dirs_white: &[(i64, i64)] = &[(1, 1), (-1, 1)];
+    let bishop_dirs_black: &[(i64, i64)] = &[(1, -1), (-1, -1)];
+    let bishop_dirs_neutral: &[(i64, i64)] = &[(1, 1), (1, -1), (-1, 1), (-1, -1)];
+
+    let bishop_dirs: &[(i64, i64)] = match color {
+        PlayerColor::White => bishop_dirs_white,
+        PlayerColor::Black => bishop_dirs_black,
+        PlayerColor::Neutral => bishop_dirs_neutral,
+    };
+
+    let mobility = slider_mobility(&game.board, x, y, bishop_dirs, 12);
+    bonus += mobility * BISHOP_MOBILITY_BONUS;
+    bump_feat!(bishop_mobility_bonus, mobility);
 
     bonus
 }
 
 fn evaluate_pawn_position(x: i64, y: i64, color: PlayerColor) -> i32 {
+    // ...
     let mut bonus: i32 = 0;
 
     // Advancement bonus - more advanced pawns are better
@@ -656,7 +655,7 @@ fn evaluate_king_safety(
 fn evaluate_king_shelter(game: &GameState, king: &Coordinate, color: PlayerColor) -> i32 {
     let mut safety: i32 = 0;
 
-    // 1. Local pawn / guard cover
+    // 1. Local pawn / guard cover (only track presence; scoring is via missing-penalty)
     let mut has_ring_cover = false;
     for dx in -1..=1_i64 {
         for dy in -1..=1_i64 {
@@ -671,17 +670,7 @@ fn evaluate_king_shelter(game: &GameState, king: &Coordinate, color: PlayerColor
                         || piece.piece_type == PieceType::Guard
                         || piece.piece_type == PieceType::Void
                     {
-                        safety += KING_RING_PAWN_BONUS;
-                        bump_feat!(king_ring_pawn_bonus, 1);
                         has_ring_cover = true;
-
-                        // Extra bonus for a front pawn/guard shield in the direction of the enemy.
-                        if (color == PlayerColor::White && cy > king.y)
-                            || (color == PlayerColor::Black && cy < king.y)
-                        {
-                            safety += KING_FRONT_SHIELD_BONUS;
-                            bump_feat!(king_front_shield_bonus, 1);
-                        }
                     }
                 }
             }
@@ -690,6 +679,48 @@ fn evaluate_king_shelter(game: &GameState, king: &Coordinate, color: PlayerColor
     if !has_ring_cover {
         safety -= KING_RING_MISSING_PENALTY;
         bump_feat!(king_ring_missing_penalty, -1);
+    }
+
+    // 1b. King relative to own pawn chain: prefer being behind pawns rather than ahead of them.
+    // We look for pawns roughly on the same files as the king (+/- 2 files) to keep it local.
+    let mut has_pawn_ahead = false;
+    let mut has_pawn_behind = false;
+    for ((px, py), piece) in &game.board.pieces {
+        if piece.color != color || piece.piece_type != PieceType::Pawn {
+            continue;
+        }
+
+        // Only consider pawns near the king in file-space
+        if (px - king.x).abs() > 2 {
+            continue;
+        }
+
+        match color {
+            PlayerColor::White => {
+                if *py > king.y {
+                    has_pawn_ahead = true;
+                } else if *py < king.y {
+                    has_pawn_behind = true;
+                }
+            }
+            PlayerColor::Black => {
+                if *py < king.y {
+                    has_pawn_ahead = true;
+                } else if *py > king.y {
+                    has_pawn_behind = true;
+                }
+            }
+            PlayerColor::Neutral => {}
+        }
+    }
+
+    // If there are pawns both ahead and behind, we assume a mixed structure and stay neutral.
+    if has_pawn_ahead && !has_pawn_behind {
+        // King is safely tucked behind its pawn shield.
+        safety += KING_PAWN_SHIELD_BONUS;
+    } else if !has_pawn_ahead && has_pawn_behind {
+        // King has walked in front of its pawn chain.
+        safety -= KING_PAWN_AHEAD_PENALTY;
     }
 
     // 2. Open rays (more open lines = more vulnerable)
@@ -765,20 +796,6 @@ fn evaluate_king_shelter(game: &GameState, king: &Coordinate, color: PlayerColor
     safety -= enemy_slider_threats * KING_ENEMY_SLIDER_PENALTY;
     bump_feat!(king_enemy_slider_penalty, -enemy_slider_threats);
 
-    // 4. Friendly knights close to the king act as dynamic shields.
-    for ((x, y), piece) in &game.board.pieces {
-        if piece.color != color {
-            continue;
-        }
-        if piece.piece_type == PieceType::Knight {
-            let dist = (x - king.x).abs() + (y - king.y).abs();
-            if dist <= 3 {
-                safety += KING_KNIGHT_SHIELD_BONUS;
-                bump_feat!(king_knight_shield_bonus, 1);
-            }
-        }
-    }
-
     safety
 }
 
@@ -827,55 +844,7 @@ fn evaluate_pawn_structure(game: &GameState) -> i32 {
         prev_file = Some(file);
     }
 
-    // Passed pawn bonus
-    for (x, y) in &white_pawns {
-        if is_passed_pawn(*x, *y, PlayerColor::White, &black_pawns) {
-            let advanced = ((*y - 2) as i32).max(0) * 5;
-            score += PASSED_PAWN_BONUS + advanced;
-            bump_feat!(passed_pawn_bonus, 1);
-        }
-    }
-
-    for (x, y) in &black_pawns {
-        if is_passed_pawn(*x, *y, PlayerColor::Black, &white_pawns) {
-            let advanced = ((7 - *y) as i32).max(0) * 5;
-            score -= PASSED_PAWN_BONUS + advanced;
-            bump_feat!(passed_pawn_bonus, -1);
-        }
-    }
-
-    // Isolated pawn penalty
-    for (x, _) in &white_pawns {
-        let has_neighbor = white_pawns.iter().any(|(px, _)| (*px - *x).abs() == 1);
-        if !has_neighbor {
-            score -= ISOLATED_PAWN_PENALTY;
-            bump_feat!(isolated_pawn_penalty, -1);
-        }
-    }
-
-    for (x, _) in &black_pawns {
-        let has_neighbor = black_pawns.iter().any(|(px, _)| (*px - *x).abs() == 1);
-        if !has_neighbor {
-            score += ISOLATED_PAWN_PENALTY;
-            bump_feat!(isolated_pawn_penalty, 1);
-        }
-    }
-
     score
-}
-
-fn is_passed_pawn(x: i64, y: i64, color: PlayerColor, enemy_pawns: &[(i64, i64)]) -> bool {
-    for (ex, ey) in enemy_pawns {
-        // Check if enemy pawn is on same or adjacent file and ahead
-        if (*ex - x).abs() <= 1 {
-            if color == PlayerColor::White && *ey > y {
-                return false;
-            } else if color == PlayerColor::Black && *ey < y {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 // ==================== Helper Functions ====================

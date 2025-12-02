@@ -334,7 +334,7 @@ impl Engine {
     /// so callers can reuse the same search for adjudication.
     pub fn get_best_move_with_time(&mut self, time_limit_ms: u32) -> JsValue {
         if let Some((best_move, eval)) =
-            search::get_best_move_timed_with_eval(&mut self.game, 50, time_limit_ms as u128, true)
+            search::get_best_move_timed_with_eval(&mut self.game, 50, time_limit_ms as u128, false)
         {
             let js_move = JsMoveWithEval {
                 from: format!("{},{}", best_move.from.x, best_move.from.y),
