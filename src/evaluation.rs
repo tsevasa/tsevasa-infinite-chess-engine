@@ -1,5 +1,7 @@
 use crate::board::{Board, Coordinate, PieceType, PlayerColor};
 use crate::game::GameState;
+use crate::Variant;
+
 #[cfg(feature = "eval_tuning")]
 use once_cell::sync::Lazy;
 #[cfg(feature = "eval_tuning")]
@@ -67,6 +69,30 @@ macro_rules! bump_feat {
 }
 
 // ==================== Piece Values ====================
+
+/// Run a block of evaluation code only for a specific variant.
+/// Usage inside evaluate():
+///   variant_block!(game, Variant::PawnHorde, {
+///       score += 50;
+///   });
+macro_rules! variant_block {
+    ($game:expr, $name:expr, $body:block) => {
+        if $game.variant == Some($name) {
+            $body
+        }
+    };
+}
+
+/// Run a single statement only for a specific variant.
+/// Usage inside evaluate():
+///   variant_line!(game, Variant::Space, score += 10;);
+macro_rules! variant_line {
+    ($game:expr, $name:expr, $stmt:stmt) => {
+        if $game.variant == Some($name) {
+            $stmt
+        }
+    };
+}
 
 pub fn get_piece_value(piece_type: PieceType) -> i32 {
     match piece_type {
@@ -213,6 +239,14 @@ pub fn evaluate(game: &GameState) -> i32 {
         score += evaluate_king_safety(game, &white_king, &black_king);
         score += evaluate_pawn_structure(game);
     }
+
+    // Extra eval only in certain variants:
+    variant_line!(game, Variant::PawnHorde, {
+        // e.g. bonus when white has many pawns still alive
+        if game.white_piece_count > game.black_piece_count {
+            score += 10;
+        }
+    });
 
     // Return from current player's perspective
     if game.turn == PlayerColor::Black {
@@ -1959,10 +1993,10 @@ pub fn calculate_initial_material(board: &Board) -> i32 {
     let mut score = 0;
     for (_, piece) in &board.pieces {
         let value = get_piece_value(piece.piece_type);
-        if piece.color == PlayerColor::White {
-            score += value;
-        } else {
-            score -= value;
+        match piece.color {
+            PlayerColor::White => score += value,
+            PlayerColor::Black => score -= value,
+            PlayerColor::Neutral => {}
         }
     }
     score

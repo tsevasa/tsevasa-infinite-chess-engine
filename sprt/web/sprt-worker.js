@@ -1,65 +1,155 @@
 import initOld, { Engine as EngineOld } from './pkg-old/hydrochess_wasm.js';
 import initNew, { Engine as EngineNew } from './pkg-new/hydrochess_wasm.js';
+import { getVariantData, getAllVariants } from './variants.js';
 
 let wasmReady = false;
 
-function getStandardPosition() {
+function getVariantPosition(variantName, clock = null) {
+    const variantData = getVariantData(variantName);
     const pieces = [];
-    pieces.push({ x: '1', y: '1', piece_type: 'r', player: 'w' });
-    pieces.push({ x: '2', y: '1', piece_type: 'n', player: 'w' });
-    pieces.push({ x: '3', y: '1', piece_type: 'b', player: 'w' });
-    pieces.push({ x: '4', y: '1', piece_type: 'q', player: 'w' });
-    pieces.push({ x: '5', y: '1', piece_type: 'k', player: 'w' });
-    pieces.push({ x: '6', y: '1', piece_type: 'b', player: 'w' });
-    pieces.push({ x: '7', y: '1', piece_type: 'n', player: 'w' });
-    pieces.push({ x: '8', y: '1', piece_type: 'r', player: 'w' });
-    for (let i = 1; i <= 8; i++) {
-        pieces.push({ x: String(i), y: '2', piece_type: 'p', player: 'w' });
-    }
-    pieces.push({ x: '1', y: '8', piece_type: 'r', player: 'b' });
-    pieces.push({ x: '2', y: '8', piece_type: 'n', player: 'b' });
-    pieces.push({ x: '3', y: '8', piece_type: 'b', player: 'b' });
-    pieces.push({ x: '4', y: '8', piece_type: 'q', player: 'b' });
-    pieces.push({ x: '5', y: '8', piece_type: 'k', player: 'b' });
-    pieces.push({ x: '6', y: '8', piece_type: 'b', player: 'b' });
-    pieces.push({ x: '7', y: '8', piece_type: 'n', player: 'b' });
-    pieces.push({ x: '8', y: '8', piece_type: 'r', player: 'b' });
-    for (let i = 1; i <= 8; i++) {
-        pieces.push({ x: String(i), y: '7', piece_type: 'p', player: 'b' });
-    }
+    const special_rights = []; // Build dynamically from '+' suffix
+    
+    // Parse ICN position string into pieces array
+    for (const pieceStr of variantData.position.split('|')) {
+        if (!pieceStr) continue;
+        
+        const parts = pieceStr.split(',');
+        if (parts.length !== 2) continue;
+        
+        const pieceInfo = parts[0];
+        const yStr = parts[1];
+        
+        if (!pieceInfo) continue;
 
-    // Standard infinite-chess special rights: all pawns (double-step)
-    // plus kings and rooks (castling and related king/rook rights).
-    const special_rights = [];
-    for (let i = 1; i <= 8; i++) {
-        special_rights.push(i + ',2'); // white pawns
-        special_rights.push(i + ',7'); // black pawns
+        // Split pieceInfo into a variable-length piece code and numeric x coordinate.
+        // Examples:
+        //   "P1"    -> pieceCode="P",  xPart="1"
+        //   "AM3"   -> pieceCode="AM", xPart="3"
+        //   "AR4+"  -> pieceCode="AR", xPart="4+"
+        let splitIndex = 0;
+        while (splitIndex < pieceInfo.length) {
+            const ch = pieceInfo[splitIndex];
+            if ((ch >= '0' && ch <= '9') || ch === '-') {
+                break;
+            }
+            splitIndex++;
+        }
+
+        const pieceCode = pieceInfo.slice(0, splitIndex);
+        const xRaw = pieceInfo.slice(splitIndex);
+
+        if (!pieceCode || !xRaw) continue;
+
+        // Side to move comes from piece code casing (first char of code)
+        const isWhite = pieceCode[0] === pieceCode[0].toUpperCase();
+        const player = isWhite ? 'w' : 'b';
+
+        // Handle special rights (+ suffix) - check both x and y for safety
+        const hasSpecialRights = xRaw.endsWith('+') || yStr.endsWith('+');
+        const x = xRaw.endsWith('+') ? xRaw.slice(0, -1) : xRaw;
+        const y = yStr.endsWith('+') ? yStr.slice(0, -1) : yStr;
+        
+        // Validate coordinates are valid numbers (allow negative and multi-digit)
+        if (isNaN(parseInt(x, 10)) || isNaN(parseInt(y, 10))) {
+            console.warn(`Invalid coordinates in ICN: ${pieceStr} -> x:${x}, y:${y}`);
+            continue;
+        }
+        
+        // Add to special_rights array if this piece has special rights
+        if (hasSpecialRights) {
+            special_rights.push(`${x},${y}`);
+        }
+
+        // Map piece types (including multi-letter raw ICN codes) to engine codes
+        // Engine single-letter codes from README.md:
+        //  p Pawn, n Knight, b Bishop, r Rook, q Queen, k King
+        //  m Amazon, c Chancellor, a Archbishop, e Centaur, d Royal Centaur,
+        //  h Hawk, g Guard, s Knightrider, l Camel, i Giraffe, z Zebra, y Royal Queen
+        const codeLower = pieceCode.toLowerCase();
+        let piece_type;
+        switch (codeLower) {
+            // Standard pieces
+            case 'k': piece_type = 'k'; break;
+            case 'q': piece_type = 'q'; break;
+            case 'r': piece_type = 'r'; break;
+            case 'b': piece_type = 'b'; break;
+            case 'n': piece_type = 'n'; break;
+            case 'p': piece_type = 'p'; break;
+
+            // Amazon (raw ICN 'am') -> engine 'm'
+            case 'am': piece_type = 'm'; break;
+
+            // Chancellor (raw ICN 'ch') -> engine 'c'
+            case 'ch': piece_type = 'c'; break;
+
+            // Archbishop (raw ICN 'ar') -> engine 'a'
+            case 'ar': piece_type = 'a'; break;
+
+            // Hawk (raw ICN 'ha') -> engine 'h'
+            case 'ha': piece_type = 'h'; break;
+
+            // Guard (raw ICN 'gu') -> engine 'g'
+            case 'gu': piece_type = 'g'; break;
+
+            // Camel (raw ICN 'ca') -> engine 'l'
+            case 'ca': piece_type = 'l'; break;
+
+            // Giraffe (raw ICN 'gi') -> engine 'i'
+            case 'gi': piece_type = 'i'; break;
+
+            // Zebra (raw ICN 'ze') -> engine 'z'
+            case 'ze': piece_type = 'z'; break;
+
+            // Centaur (raw ICN 'ce') -> engine 'e'
+            case 'ce': piece_type = 'e'; break;
+
+            // Royal Queen (raw ICN 'rq') -> engine 'y'
+            case 'rq': piece_type = 'y'; break;
+
+            // Royal Centaur (raw ICN 'rc') -> engine 'd'
+            case 'rc': piece_type = 'd'; break;
+
+            // Knightrider (raw ICN 'nr') -> engine 's'
+            case 'nr': piece_type = 's'; break;
+
+            // Huygen (raw ICN 'hu') -> engine 'u'
+            case 'hu': piece_type = 'u'; break;
+
+            // Rose (raw ICN 'ro') -> engine 'o'; break;
+            case 'ro': piece_type = 'o'; break;
+
+            // Neutrals / other engine-local codes
+            case 'ob':
+                piece_type = 'x'; break; // Obstacle
+            case 'vo':
+                piece_type = 'v'; break; // Void
+
+            default:
+                continue; // Skip unknown pieces
+        }
+
+        pieces.push({ x, y, piece_type, player });
     }
-    // White rooks and king
-    special_rights.push('1,1');
-    special_rights.push('8,1');
-    special_rights.push('5,1');
-    // Black rooks and king
-    special_rights.push('1,8');
-    special_rights.push('8,8');
-    special_rights.push('5,8');
 
     return {
         board: { pieces },
-        // Starting side for the game; the WASM engine will reconstruct the
-        // current side-to-move by replaying move_history.
         turn: 'w',
-        // Support both old and new APIs: legacy castling_rights for old EngineOld
-        // builds, and special_rights for the new engine.
-        castling_rights: [],
-        special_rights,
+        castling_rights: [], // Legacy for old EngineOld builds
+        special_rights, // Use dynamically built array from '+' suffix
         en_passant: null,
         halfmove_clock: 0,
         fullmove_number: 1,
         move_history: [],
         game_rules: null,
         world_bounds: null,
+        clock,
+        variant: variantName, // Add variant name for custom evaluation
     };
+}
+
+function getStandardPosition(clock = null) {
+    // Fallback to Classical variant for backward compatibility
+    return getVariantPosition('Classical', clock);
 }
 
 function applyMove(position, move) {
@@ -165,8 +255,8 @@ async function ensureInit() {
     }
 }
 
-async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove, materialThreshold, baseTimeMs, incrementMs, timeControl) {
-    const startPosition = getStandardPosition();
+async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove, materialThreshold, baseTimeMs, incrementMs, timeControl, variantName = 'Classical') {
+    const startPosition = getVariantPosition(variantName);
     let position = clonePosition(startPosition);
     const newColor = newPlaysWhite ? 'w' : 'b';
     const moveLines = [];
@@ -277,6 +367,16 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove,
         // state (clocks, en passant, special rights) by replaying moves.
         const gameInput = clonePosition(startPosition);
         gameInput.move_history = moveHistory.slice();
+        
+        // Include clock info in the game state so the engine can manage its own time
+        if (haveClocks) {
+            gameInput.clock = {
+                wtime: Math.floor(whiteClock),
+                btime: Math.floor(blackClock),
+                winc: Math.floor(increment),
+                binc: Math.floor(increment),
+            };
+        }
 
         // Let the appropriate engine choose a move on this gameInput
         const EngineClass = isWhiteTurn
@@ -287,19 +387,30 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove,
             : (newPlaysWhite ? 'old' : 'new');
 
         let searchTimeMs = timePerMove;
-        if (haveClocks) {
-            const currentClock = isWhiteTurn ? whiteClock : blackClock;
-            const baseSec = Math.max(0, currentClock / 1000);
-            const incSec = increment / 1000;
-            // Dynamic per-move limit: (currentBase/20 + inc/2) seconds
-            searchTimeMs = Math.max(10, Math.round(((baseSec / 20) + (incSec / 2)) * 1000));
-        }
-
+        let flaggedOnTime = false;
         const engine = new EngineClass(gameInput);
         const startMs = haveClocks ? nowMs() : 0;
-        const move = engine.get_best_move_with_time(searchTimeMs);
+        
+        // Safety check: if clock time is already zero or negative, flag timeout immediately
+        if (haveClocks) {
+            const currentClock = isWhiteTurn ? whiteClock : blackClock;
+            if (currentClock <= 0) {
+                flaggedOnTime = true;
+                engine.free();
+                return {
+                    result: isWhiteTurn ? 'black' : 'white',
+                    reason: 'timeout',
+                    moveHistory,
+                    moveLines,
+                    texelSamples,
+                    adjudicated: false,
+                    engineStats: { ...engineStats }
+                };
+            }
+        }
+        
+        const move = engine.get_best_move_with_time(haveClocks ? 0 : searchTimeMs);
         engine.free();
-        let flaggedOnTime = false;
         if (haveClocks) {
             const elapsed = Math.max(0, Math.round(nowMs() - startMs));
             if (isWhiteTurn) {
@@ -458,6 +569,7 @@ self.onmessage = async (e) => {
                 msg.baseTimeMs,
                 msg.incrementMs,
                 msg.timeControl,
+                msg.variantName || 'Classical', // Default to Classical if not specified
             );
             self.postMessage({
                 type: 'result',
@@ -469,6 +581,7 @@ self.onmessage = async (e) => {
                 materialThreshold: materialThreshold ?? msg.materialThreshold ?? null,
                 timeControl: msg.timeControl || null,
                 samples: samples || [],
+                variantName: msg.variantName || 'Classical',
             });
         } catch (err) {
             self.postMessage({
@@ -477,5 +590,11 @@ self.onmessage = async (e) => {
                 error: err.message || String(err),
             });
         }
+    } else if (msg.type === 'getVariants') {
+        // Return list of available variants for UI dropdown
+        self.postMessage({
+            type: 'variants',
+            variants: getAllVariants(),
+        });
     }
 };

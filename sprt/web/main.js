@@ -14,6 +14,7 @@ const sprtMinGames = document.getElementById('sprtMinGames');
 const sprtMaxGames = document.getElementById('sprtMaxGames');
 const sprtMaxMoves = document.getElementById('sprtMaxMoves');
 const sprtMaterialThresholdEl = document.getElementById('sprtMaterialThreshold');
+const sprtVariantsEl = document.getElementById('sprtVariants');
 const runSprtBtn = document.getElementById('runSprt');
 const stopSprtBtn = document.getElementById('stopSprt');
 const sprtWinsEl = document.getElementById('sprtWins');
@@ -45,6 +46,11 @@ let lastElo = 0;
 let lastEloError = 0;
 let lastLLR = 0;
 let lastBounds = null;
+// Variant management
+let availableVariants = [];
+let selectedVariants = [];
+let variantQueue = [];
+let currentVariantIndex = 0;
 
 // SPRT configuration (mirrors sprt.js)
 const CONFIG = {
@@ -79,6 +85,85 @@ const WHITE_FIRST_MOVES = [
 
 function getRandomOpening() {
     return WHITE_FIRST_MOVES[Math.floor(Math.random() * WHITE_FIRST_MOVES.length)];
+}
+
+// Variant management functions
+function loadVariants() {
+    // Create a temporary worker to get variants
+    const worker = new Worker('./sprt-worker.js', { type: 'module' });
+    
+    worker.onmessage = (e) => {
+        if (e.data.type === 'variants') {
+            availableVariants = e.data.variants;
+            populateVariantDropdown();
+            loadVariantSelection();
+            worker.terminate();
+        }
+    };
+    
+    worker.postMessage({ type: 'getVariants' });
+}
+
+function populateVariantDropdown() {
+    sprtVariantsEl.innerHTML = '';
+    availableVariants.forEach(variant => {
+        const option = document.createElement('option');
+        option.value = variant;
+        option.textContent = variant;
+        option.selected = true; // Default all selected
+        sprtVariantsEl.appendChild(option);
+    });
+}
+
+function loadVariantSelection() {
+    const saved = localStorage.getItem('sprtSelectedVariants');
+    if (saved) {
+        try {
+            const savedArray = JSON.parse(saved);
+            // Clear all selections first
+            Array.from(sprtVariantsEl.options).forEach(option => {
+                option.selected = false;
+            });
+            // Apply saved selections
+            savedArray.forEach(variantName => {
+                const option = Array.from(sprtVariantsEl.options).find(opt => opt.value === variantName);
+                if (option) option.selected = true;
+            });
+        } catch (e) {
+            console.warn('Failed to load saved variant selection:', e);
+        }
+    }
+    updateSelectedVariants();
+}
+
+function saveVariantSelection() {
+    localStorage.setItem('sprtSelectedVariants', JSON.stringify(selectedVariants));
+}
+
+function updateSelectedVariants() {
+    selectedVariants = Array.from(sprtVariantsEl.selectedOptions).map(option => option.value);
+    saveVariantSelection();
+    buildVariantQueue();
+}
+
+function buildVariantQueue() {
+    variantQueue = [];
+    // Build queue with each variant appearing twice (for both colors)
+    selectedVariants.forEach(variant => {
+        variantQueue.push({ variant, newPlaysWhite: true });
+        variantQueue.push({ variant, newPlaysWhite: false });
+    });
+    currentVariantIndex = 0;
+}
+
+function getNextVariant() {
+    if (variantQueue.length === 0) {
+        return { variant: 'Classical', newPlaysWhite: true };
+    }
+    
+    const result = variantQueue[currentVariantIndex];
+    currentVariantIndex = (currentVariantIndex + 1) % variantQueue.length;
+    return result;
 }
 
 const BOUNDS_PRESETS = {
@@ -169,7 +254,7 @@ function getStandardPosition() {
 // newPlaysWhite indicates which engine (new vs old) had White.
 // endReason may be 'material_adjudication' or null.
 // materialThreshold is the cp threshold used for adjudication, if any.
-function generateICNFromWorkerLog(workerLog, gameIndex, result, newPlaysWhite, endReason, materialThreshold, timeControl) {
+function generateICNFromWorkerLog(workerLog, gameIndex, result, newPlaysWhite, endReason, materialThreshold, timeControl, variantName = 'Classical') {
     const utc = new Date();
     const pad = (n) => String(n).padStart(2, '0');
     const utcDate = `${utc.getUTCFullYear()}.${pad(utc.getUTCMonth() + 1)}.${pad(utc.getUTCDate())}`;
@@ -196,7 +281,7 @@ function generateICNFromWorkerLog(workerLog, gameIndex, result, newPlaysWhite, e
     const headerList = [
         `[Event "SPRT Test Game ${gameIndex}"]`,
         `[Site "https://www.infinitechess.org/"]`,
-        `[Variant "Classical"]`,
+        `[Variant "${variantName}"]`,
         `[Round "-"]`,
         `[UTCDate "${utcDate}"]`,
         `[UTCTime "${utcTime}"]`,
@@ -541,11 +626,15 @@ async function runSprt() {
         const gameIndex = nextGameIndex++;
         if (gameIndex >= maxGames) return false;
         activeWorkers++;
-        // Games run in pairs: 0-1 share opening, 2-3 share opening, etc.
-        // Even index = new engine plays white, odd index = old engine plays white
+        
+        // Get next variant from the cycling queue
+        const { variant: variantName, newPlaysWhite } = getNextVariant();
+        
+        // Games run in pairs: each variant appears twice (both colors)
         const pairIndex = Math.floor(gameIndex / 2);
-        const openingMove = getOpeningForPair(pairIndex);
-        const newPlaysWhite = (gameIndex % 2) === 0;
+        // Only use opening moves for Classical variant to avoid errors with custom positions
+        const openingMove = variantName === 'Classical' ? getOpeningForPair(pairIndex) : null;
+        
         worker.postMessage({
             type: 'runGame',
             gameIndex,
@@ -557,6 +646,7 @@ async function runSprt() {
             baseTimeMs: tc.baseMs,
             incrementMs: tc.incMs,
             timeControl: tc.tcString,
+            variantName, // Add variant to the message
         });
         return true;
     }
@@ -590,6 +680,7 @@ async function runSprt() {
                             msg.reason,
                             msg.materialThreshold,
                             msg.timeControl,
+                            msg.variantName, // Add variant to ICN log
                         );
                         gameLogs.push(icnLog);
 
@@ -791,6 +882,10 @@ stopSprtBtn.addEventListener('click', stopSprt);
 copyLogBtn.addEventListener('click', copyLog);
 downloadLogsBtn.addEventListener('click', downloadLogs);
 downloadGamesBtn.addEventListener('click', downloadGames);
+sprtVariantsEl.addEventListener('change', updateSelectedVariants);
+
+// Initialize variant loading
+loadVariants();
 
 // Minimal hooks for headless tuning via Puppeteer. These do not change
 // UI behavior but allow a Node script to inspect results and readiness.
