@@ -1132,6 +1132,111 @@ impl GameState {
         nodes
     }
 
+    pub fn setup_position_from_icn(&mut self, position_icn: &str) {
+        self.board = Board::new();
+        self.special_rights.clear();
+        self.en_passant = None;
+        self.turn = PlayerColor::White;
+        self.halfmove_clock = 0;
+        self.fullmove_number = 1;
+        self.material_score = 0;
+
+        // Parse ICN format: "PieceType,x,y|PieceType,x,y|..."
+        // Example: "P1,2|r2,3|K4,5" where:
+        // - P = white pawn at (1,2)
+        // - r = black rook at (2,3)
+        // - K = white king at (4,5)
+        // Optional + after piece indicates special rights: "P1,2+|r2,3+"
+        for piece_str in position_icn.split('|') {
+            if piece_str.is_empty() {
+                continue;
+            }
+
+            // Split into piece_info and coordinates: "P1,2" -> ["P1", "2"]
+            let parts: Vec<&str> = piece_str.split(',').collect();
+            if parts.len() != 2 {
+                continue; // Skip invalid pieces
+            }
+
+            let (piece_info, y_str) = (parts[0], parts[1]);
+
+            // Extract piece type and x coordinate from piece_info: "P1" -> ('P', '1')
+            let mut chars = piece_info.chars();
+            let piece_char = chars.next();
+            let x_str: String = chars.collect();
+
+            if piece_char.is_none() {
+                continue;
+            }
+
+            let x: i64 = x_str.parse().unwrap_or(0);
+            let y: i64 = y_str.parse().unwrap_or(0);
+
+            // Extract piece type and check for special rights
+            let piece_char = piece_char.unwrap();
+            let (actual_piece_char, has_special_rights) = if x_str.ends_with('+') {
+                // Format like "P1+,2" - special rights indicated
+                let _clean_x = &x_str[..x_str.len() - 1]; // Prefix with underscore to indicate unused
+                (piece_char, true)
+            } else {
+                (piece_char, false)
+            };
+
+            let is_white = actual_piece_char.is_uppercase();
+            let piece_type = match actual_piece_char.to_ascii_lowercase() {
+                'k' => PieceType::King,
+                'q' => PieceType::Queen,
+                'r' => PieceType::Rook,
+                'b' => PieceType::Bishop,
+                'n' => PieceType::Knight,
+                'p' => PieceType::Pawn,
+                // Extended pieces for variants
+                'a' => PieceType::Amazon,
+                'c' => PieceType::Chancellor,
+                'h' => PieceType::Archbishop,
+                'v' => PieceType::Void,
+                'x' => PieceType::Obstacle,
+                'g' => PieceType::Giraffe,
+                'l' => PieceType::Camel, // 'l' for camel ( avoid 'c' conflict with chancellor
+                'z' => PieceType::Zebra,
+                'm' => PieceType::Knightrider, // 'm' for knightrider
+                _ => continue,                 // Skip unknown piece types
+            };
+
+            let color = if is_white {
+                PlayerColor::White
+            } else {
+                PlayerColor::Black
+            };
+            let piece = Piece::new(piece_type, color);
+
+            // Use the cleaned x coordinate if we had special rights
+            let final_x = if has_special_rights && x_str.ends_with('+') {
+                let clean_x = &x_str[..x_str.len() - 1];
+                clean_x.parse().unwrap_or(x)
+            } else {
+                x
+            };
+
+            self.board.set_piece(final_x, y, piece);
+
+            // Add special rights if indicated by +
+            if has_special_rights {
+                // coord_key was unused, removing the format string since we only need the coordinate
+                self.special_rights.insert(Coordinate::new(final_x, y));
+            }
+        }
+
+        // Calculate initial material
+        self.material_score = calculate_initial_material(&self.board);
+
+        // Rebuild piece lists and counts
+        self.recompute_piece_counts();
+
+        // Compute initial hash
+        self.recompute_hash();
+    }
+
     pub fn setup_standard_chess(&mut self) {
         self.board = Board::new();
         self.special_rights.clear();

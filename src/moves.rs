@@ -22,6 +22,108 @@ pub fn set_world_bounds(left: i64, right: i64, bottom: i64, top: i64) {
     }
 }
 
+/// Generate all pseudo-legal moves for a Knightrider.
+/// A Knightrider slides like a knight repeated along its direction until blocked or out of bounds.
+fn generate_knightrider_moves(board: &Board, from: &Coordinate, piece: &Piece) -> Vec<Move> {
+    // All 8 knight directions
+    const KR_DIRS: [(i64, i64); 8] = [
+        (1, 2),
+        (1, -2),
+        (2, 1),
+        (2, -1),
+        (-1, 2),
+        (-1, -2),
+        (-2, 1),
+        (-2, -1),
+    ];
+
+    let piece_count = board.pieces.len();
+    let mut moves = Vec::with_capacity(piece_count * 4);
+
+    // Pre-collect piece data once
+    let mut pieces_data: Vec<(i64, i64, bool)> = Vec::with_capacity(piece_count);
+    for ((px, py), p) in &board.pieces {
+        let is_enemy = is_enemy_piece(p, piece.color);
+        pieces_data.push((*px, *py, is_enemy));
+    }
+
+    for (dx, dy) in KR_DIRS {
+        // 1. Find closest blocker along this knight ray, in units of knight-steps (k)
+        let mut closest_k: i64 = i64::MAX;
+        let mut closest_is_enemy = false;
+
+        for &(px, py, is_enemy) in &pieces_data {
+            let rx = px - from.x;
+            let ry = py - from.y;
+
+            // Solve (rx, ry) = k * (dx, dy) with integer k > 0
+            if rx == 0 && ry == 0 {
+                continue;
+            }
+
+            // dx,dy are non-zero for all knight directions
+            if rx % dx != 0 || ry % dy != 0 {
+                continue;
+            }
+
+            let kx = rx / dx;
+            let ky = ry / dy;
+            if kx <= 0 || ky <= 0 || kx != ky {
+                continue;
+            }
+
+            let k = kx; // steps along this knight ray
+            if k < closest_k {
+                closest_k = k;
+                closest_is_enemy = is_enemy;
+            }
+        }
+
+        // 2. Generate moves along this ray.
+        // If we have a blocker, generate *all* intermediate steps up to it.
+        // If we have no blocker, only generate the first two consecutive steps.
+        let max_steps: i64 = if closest_k < i64::MAX {
+            if closest_is_enemy {
+                closest_k
+            } else {
+                closest_k.saturating_sub(1)
+            }
+        } else {
+            2
+        };
+
+        if max_steps <= 0 {
+            continue;
+        }
+
+        let mut k = 1i64;
+        while k <= max_steps {
+            let x = from.x + dx * k;
+            let y = from.y + dy * k;
+
+            if !in_bounds(x, y) {
+                break;
+            }
+
+            if let Some(blocker) = board.get_piece(&x, &y) {
+                // Enemy: can capture on this square.
+                if blocker.color != piece.color && blocker.piece_type != PieceType::Void {
+                    moves.push(Move::new(*from, Coordinate::new(x, y), *piece));
+                }
+                // Either way, ray stops at first blocker.
+                break;
+            } else {
+                // Empty square: normal quiet move (only within the window).
+                moves.push(Move::new(*from, Coordinate::new(x, y), *piece));
+            }
+
+            k += 1;
+        }
+    }
+
+    moves
+}
+
 /// Check if a coordinate is within valid bounds (world border)
 #[inline]
 pub fn in_bounds(x: i64, y: i64) -> bool {
@@ -379,14 +481,8 @@ pub fn get_quiescence_captures(
 
             // Knightrider: sliding along knight vectors
             PieceType::Knightrider => {
-                generate_sliding_capture_moves(
-                    board,
-                    &from,
-                    piece,
-                    &[(1, 2), (1, -2), (2, 1), (2, -1)],
-                    None,
-                    out,
-                );
+                let m = generate_knightrider_moves(board, &from, piece);
+                extend_captures_only(board, piece.color, m, out);
             }
 
             // Huygen: use existing generator and keep only captures
@@ -495,13 +591,8 @@ pub fn get_pseudo_legal_moves_for_piece(
         PieceType::Camel => generate_leaper_moves(board, from, piece, 1, 3),
         PieceType::Giraffe => generate_leaper_moves(board, from, piece, 1, 4),
         PieceType::Zebra => generate_leaper_moves(board, from, piece, 2, 3),
-        PieceType::Knightrider => generate_sliding_moves(
-            board,
-            from,
-            piece,
-            &[(1, 2), (1, -2), (2, 1), (2, -1)],
-            indices,
-        ),
+        // Knightrider: slide along all 8 knight directions until blocked
+        PieceType::Knightrider => generate_knightrider_moves(board, from, piece),
         PieceType::Centaur => {
             let mut m = generate_compass_moves(board, from, piece, 1);
             m.extend(generate_leaper_moves(board, from, piece, 1, 2));

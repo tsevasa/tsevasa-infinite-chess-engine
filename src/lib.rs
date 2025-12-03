@@ -548,8 +548,8 @@ impl Engine {
         self.game.perft(depth)
     }
 
-    pub fn setup_standard_chess(&mut self) {
-        self.game.setup_standard_chess();
+    pub fn setup_position(&mut self, position_icn: &str) {
+        self.game.setup_position_from_icn(position_icn);
     }
 
     /// Returns all legal moves as a JS array of {from: "x,y", to: "x,y", promotion: string|null}
