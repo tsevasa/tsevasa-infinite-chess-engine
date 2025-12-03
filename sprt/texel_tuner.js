@@ -22,47 +22,31 @@ const OUTPUT_FILE = path.join(DATA_DIR, 'eval_params_tuned.json');
 
 const TEXEL_CONFIG = {
   cpScale: 400.0,
-  maxSamples: 6000,
   rounds: 2,
   minStepFraction: 0.25,
 };
 
-// Only non-piece, non-endgame parameters are tunable here.
+// Only non-piece, non-endgame parameters that still exist in EvalFeatures / evaluation.rs
+// are tunable here.
 const TUNABLE_PARAMS = [
-  { name: 'king_ring_pawn_bonus', step: 4, min: 0, max: 80 },
   { name: 'king_ring_missing_penalty', step: 6, min: 0, max: 120 },
   { name: 'king_open_ray_penalty', step: 2, min: 0, max: 40 },
   { name: 'king_enemy_slider_penalty', step: 4, min: 0, max: 80 },
-  { name: 'knight_near_king_bonus', step: 2, min: 0, max: 40 },
-  { name: 'king_front_shield_bonus', step: 2, min: 0, max: 60 },
-  { name: 'king_knight_shield_bonus', step: 2, min: 0, max: 40 },
-
-  { name: 'rook_behind_king_bonus', step: 2, min: 0, max: 60 },
-  { name: 'queen_behind_king_bonus', step: 2, min: 0, max: 80 },
-  { name: 'bishop_behind_king_bonus', step: 2, min: 0, max: 60 },
-  { name: 'king_tropism_bonus', step: 1, min: 0, max: 16 },
 
   { name: 'dev_queen_back_rank_penalty', step: 4, min: 0, max: 100 },
   { name: 'dev_rook_back_rank_penalty', step: 2, min: 0, max: 80 },
   { name: 'dev_minor_back_rank_penalty', step: 2, min: 0, max: 60 },
 
-  { name: 'rook_open_file_bonus', step: 2, min: 0, max: 80 },
-  { name: 'rook_semi_open_bonus', step: 2, min: 0, max: 60 },
-  { name: 'rook_far_attack_bonus', step: 1, min: 0, max: 24 },
   { name: 'rook_idle_penalty', step: 2, min: 0, max: 60 },
-  { name: 'rook_near_enemy_file_bonus', step: 1, min: 0, max: 32 },
 
   { name: 'slider_mobility_bonus', step: 1, min: 0, max: 16 },
   { name: 'bishop_mobility_bonus', step: 1, min: 0, max: 16 },
 
-  { name: 'passed_pawn_bonus', step: 2, min: 0, max: 60 },
   { name: 'doubled_pawn_penalty', step: 1, min: 0, max: 40 },
-  { name: 'isolated_pawn_penalty', step: 1, min: 0, max: 40 },
 
   { name: 'bishop_pair_bonus', step: 4, min: 0, max: 120 },
   { name: 'queen_too_close_to_king_penalty', step: 4, min: 0, max: 120 },
   { name: 'queen_fork_zone_bonus', step: 2, min: 0, max: 60 },
-  { name: 'queen_ideal_line_dist', step: 1, min: 2, max: 12 },
 ];
 
 // Utility to map parameter names (king_ring_pawn_bonus) to Rust const names (KING_RING_PAWN_BONUS).
@@ -234,6 +218,8 @@ async function tuneSingleParam(params, spec, samples, currentLoss, cfg) {
   let bestLoss = currentLoss;
   let improved = false;
 
+  const sampleCount = samples.length || 1;
+
   let step = spec.step;
   const minStep = Math.max(1, Math.floor(spec.step * TEXEL_CONFIG.minStepFraction));
   const maxIterations = 8;
@@ -252,7 +238,6 @@ async function tuneSingleParam(params, spec, samples, currentLoss, cfg) {
     for (const v of candidates) {
       const testParams = { ...params, [spec.name]: v };
       const loss = evaluateLoss(testParams, samples, cfg);
-      console.log(`[texel]   test ${spec.name}=${v} -> negLL=${loss.toFixed(4)} (best=${bestLoss.toFixed(4)})`);
       if (loss + 1e-6 < bestLoss) {
         bestLoss = loss;
         bestValue = v;
@@ -272,7 +257,11 @@ async function tuneSingleParam(params, spec, samples, currentLoss, cfg) {
   }
 
   if (improved) {
-    console.log(`[texel]   ${spec.name} improved: ${params[spec.name]} -> ${bestValue}, negLL=${bestLoss.toFixed(4)}`);
+    const avg = bestLoss / sampleCount;
+    console.log(
+      `[texel]   ${spec.name} improved: ${params[spec.name]} -> ${bestValue}, ` +
+        `negLL=${bestLoss.toFixed(4)} (avg=${avg.toFixed(6)} per sample)`,
+    );
   } else {
     console.log(`[texel]   ${spec.name} no improvement (stays at ${bestValue})`);
   }
@@ -288,15 +277,18 @@ async function main() {
   }
   const all = samples.slice();
   shuffleInPlace(all);
-  const max = TEXEL_CONFIG.maxSamples > 0 ? TEXEL_CONFIG.maxSamples : all.length;
-  const used = all.slice(0, Math.min(max, all.length));
+  const used = all;
 
-  console.log(`[texel] Loaded dataset: ${all.length} samples, using ${used.length} for tuning`);
+  console.log(`[texel] Loaded dataset: ${used.length} samples (using all for tuning)`);
 
   const defaultParams = loadDefaultsFromEvaluation();
   const params = { ...defaultParams };
   let bestLoss = evaluateLoss(params, used, TEXEL_CONFIG);
-  console.log(`[texel] Baseline neg-log-likelihood: ${bestLoss.toFixed(4)}`);
+  const baselineAvg = bestLoss / used.length;
+  console.log(
+    `[texel] Baseline neg-log-likelihood: ${bestLoss.toFixed(4)} ` +
+      `(avg=${baselineAvg.toFixed(6)} per sample)`,
+  );
 
   for (let round = 0; round < TEXEL_CONFIG.rounds; round++) {
     console.log(`\n[texel] ===== Round ${round + 1}/${TEXEL_CONFIG.rounds} =====`);
@@ -311,7 +303,11 @@ async function main() {
       }
     }
 
-    console.log(`[texel] Round ${round + 1} complete; negLL=${bestLoss.toFixed(4)}`);
+    const roundAvg = bestLoss / used.length;
+    console.log(
+      `[texel] Round ${round + 1} complete; negLL=${bestLoss.toFixed(4)} ` +
+        `(avg=${roundAvg.toFixed(6)} per sample)`,
+    );
 
     if (!roundImproved) {
       console.log('[texel] No improvements in this round; stopping early.');

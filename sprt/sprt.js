@@ -87,15 +87,37 @@ function buildNewWebPkg() {
 
 function startServer() {
     console.log('[web-sprt] Starting dev server in sprt/web (npx serve .)');
-    console.log('[web-sprt] Open this URL in your browser (default): http://localhost:3000');
 
     const child = spawn('npx', ['serve', '.'], {
         cwd: WEB_DIR,
-        // Silence verbose HTTP 2xx/304 access logs on stdout while keeping
-        // error output visible on stderr.
-        stdio: ['ignore', 'ignore', 'inherit'],
+        // Capture stdout so we can detect the chosen port, but do not forward
+        // the raw logs. Keep stderr inherited for error visibility.
+        stdio: ['ignore', 'pipe', 'inherit'],
         shell: true, // avoid EINVAL on Windows by using shell resolution for npx
     });
+
+    let sawUrl = false;
+    let buffer = '';
+
+    if (child.stdout) {
+        child.stdout.on('data', (chunk) => {
+            buffer += chunk.toString();
+            let idx;
+            while ((idx = buffer.indexOf('\n')) !== -1) {
+                const line = buffer.slice(0, idx).trim();
+                buffer = buffer.slice(idx + 1);
+
+                if (!sawUrl) {
+                    const m = line.match(/https?:\/\/(localhost|127\.0\.0\.1):(\d+)/i);
+                    if (m) {
+                        sawUrl = true;
+                        const url = `http://${m[1]}:${m[2]}`;
+                        console.log('[web-sprt] Open this URL in your browser: ' + url);
+                    }
+                }
+            }
+        });
+    }
 
     child.on('exit', (code) => {
         process.exit(code ?? 0);

@@ -19,7 +19,13 @@ pub const MAX_PLY: usize = 64;
 pub const INFINITY: i32 = 1_000_000;
 pub const MATE_VALUE: i32 = 900_000;
 pub const MATE_SCORE: i32 = 800_000;
-pub const THINK_TIME_MS: u128 = 3000; // 3 seconds per move
+pub const THINK_TIME_MS: u128 = 3000; // 3 seconds per move (default, may be overridden by caller)
+
+// Small penalty for drawing by threefold repetition from the side to move's
+// perspective. This discourages pointless repetitions when equal or better
+// continuations exist, but is small enough that the engine will still accept
+// a draw in worse positions.
+const REPETITION_PENALTY: i32 = 4;
 
 // Maximum absolute value for history scores (used by gravity-style updates)
 const MAX_HISTORY: i32 = 4000;
@@ -452,9 +458,26 @@ pub fn get_best_move_timed_with_eval(
             break;
         }
 
-        // If we've used more than 80% of time, don't start another iteration
-        if searcher.timer.elapsed_ms() > searcher.time_limit_ms * 8 / 10 {
-            break;
+        // If we've used more than 50% of time, don't start another iteration
+        if searcher.time_limit_ms != u128::MAX {
+            let limit = searcher.time_limit_ms;
+            let cutoff = if limit <= 300 {
+                // Very short thinks: keep ~50% heuristic
+                limit / 2
+            } else if limit <= 2000 {
+                // Short blitz: leave ~250ms safety buffer
+                limit.saturating_sub(250)
+            } else if limit <= 8000 {
+                // Rapid-ish: leave ~500ms safety buffer (e.g. 4s -> 3.5s)
+                limit.saturating_sub(500)
+            } else {
+                // Long thinks: use almost all allotted time but keep a small buffer
+                limit.saturating_sub(2000)
+            };
+
+            if searcher.timer.elapsed_ms() > cutoff {
+                break;
+            }
         }
     }
 
@@ -647,7 +670,11 @@ fn negamax(
 
     // Threefold repetition detection (uses hash_stack built during make_move/undo_move)
     if ply > 0 && game.is_threefold() {
-        return 0; // Draw by repetition
+        // Treat repetition as a slightly worse outcome than a neutral eval
+        // from the current side's perspective. This nudges the search away
+        // from pointless threefolds when other equal moves exist, while still
+        // allowing repetition in clearly worse positions.
+        return -REPETITION_PENALTY;
     }
 
     // Mate distance pruning (not at root)

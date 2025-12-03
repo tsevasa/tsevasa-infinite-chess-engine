@@ -851,7 +851,6 @@ window.__sprt_compute_features = async (rawSamples) => {
             side_to_move: side,
             ply_index: typeof s.ply_index === 'number' ? s.ply_index : null,
             piece_count: typeof s.piece_count === 'number' ? s.piece_count : null,
-            eval: evalWithFeatures.eval,
             features: evalWithFeatures.features,
             // Optional debugging/analysis fields: exact sampled position and
             // the move history used to reach it.
