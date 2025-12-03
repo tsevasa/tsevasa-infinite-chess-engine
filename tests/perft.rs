@@ -1,9 +1,9 @@
+use hydrochess_wasm::board::{Piece, PieceType, PlayerColor};
 use hydrochess_wasm::game::GameState;
 use hydrochess_wasm::moves::Move;
-use hydrochess_wasm::board::{Piece, PieceType, PlayerColor};
 
-use std::time::Instant;
 use hydrochess_wasm::search::negamax_node_count_for_depth;
+use std::time::Instant;
 
 #[test]
 fn run_perft_suite() {
@@ -68,14 +68,23 @@ fn run_perft_suite() {
     println!("Performance Summary:");
     if total_perft_micros > 0 {
         let avg_perft_nps = (total_perft_nodes * 1_000_000) / total_perft_micros.max(1);
-        println!("  Avg perft NPS over depths 1..{}: {}", max_depth, avg_perft_nps);
+        println!(
+            "  Avg perft NPS over depths 1..{}: {}",
+            max_depth, avg_perft_nps
+        );
     }
     if total_search_micros > 0 {
         let avg_search_nps = (total_search_nodes * 1_000_000) / total_search_micros.max(1);
-        println!("  Avg search NPS over depths 1..{}: {}", max_depth, avg_search_nps);
+        println!(
+            "  Avg search NPS over depths 1..{}: {}",
+            max_depth, avg_search_nps
+        );
     }
     if let Some(duration_d_max) = last_duration {
-        println!("  Depth {} perft completed in {:?}", max_depth, duration_d_max);
+        println!(
+            "  Depth {} perft completed in {:?}",
+            max_depth, duration_d_max
+        );
     }
     println!("================================================================");
 }
@@ -87,14 +96,20 @@ fn compare_evasion_generators_depth_5() {
     let mut game = GameState::new();
 
     // White pieces
-    game.board.set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));   // e1
-    game.board.set_piece(4, 1, Piece::new(PieceType::Queen, PlayerColor::White));  // d1
-    game.board.set_piece(1, 1, Piece::new(PieceType::Rook, PlayerColor::White));   // a1
-    game.board.set_piece(3, 1, Piece::new(PieceType::Bishop, PlayerColor::White)); // c1
-    game.board.set_piece(7, 1, Piece::new(PieceType::Knight, PlayerColor::White)); // g1
+    game.board
+        .set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White)); // e1
+    game.board
+        .set_piece(4, 1, Piece::new(PieceType::Queen, PlayerColor::White)); // d1
+    game.board
+        .set_piece(1, 1, Piece::new(PieceType::Rook, PlayerColor::White)); // a1
+    game.board
+        .set_piece(3, 1, Piece::new(PieceType::Bishop, PlayerColor::White)); // c1
+    game.board
+        .set_piece(7, 1, Piece::new(PieceType::Knight, PlayerColor::White)); // g1
 
     // Black king
-    game.board.set_piece(5, 8, Piece::new(PieceType::King, PlayerColor::Black));   // e8
+    game.board
+        .set_piece(5, 8, Piece::new(PieceType::King, PlayerColor::Black)); // e8
 
     game.turn = PlayerColor::White;
     game.special_rights.clear();
@@ -139,7 +154,15 @@ fn compare_evasion_generators_depth_5() {
             let mut new_legal = filter_legal_evasions(game, &cand_new);
             let mut old_legal = filter_legal_evasions(game, &all_moves);
 
-            let key = |m: &Move| (m.from.x, m.from.y, m.to.x, m.to.y, m.promotion.map(|p| p as u8));
+            let key = |m: &Move| {
+                (
+                    m.from.x,
+                    m.from.y,
+                    m.to.x,
+                    m.to.y,
+                    m.promotion.map(|p| p as u8),
+                )
+            };
 
             new_legal.sort_by_key(|m| key(m));
             old_legal.sort_by_key(|m| key(m));
@@ -147,7 +170,11 @@ fn compare_evasion_generators_depth_5() {
             *total_new += new_legal.len() as u64;
             *total_old += old_legal.len() as u64;
 
-            assert_eq!(new_legal.len(), old_legal.len(), "Evasion move count mismatch at some node");
+            assert_eq!(
+                new_legal.len(),
+                old_legal.len(),
+                "Evasion move count mismatch at some node"
+            );
             assert_eq!(
                 new_legal.iter().map(|m| key(m)).collect::<Vec<_>>(),
                 old_legal.iter().map(|m| key(m)).collect::<Vec<_>>(),
@@ -176,54 +203,100 @@ fn compare_evasion_generators_depth_5() {
     assert_eq!(total_new, total_old);
 }
 
-#[test]
-fn run_search_only_suite() {
-    println!("\n================================================================");
-    println!("Running Search-Only Suite for HydroChess WASM");
-    println!("================================================================");
-
-    // Setup Standard Chess
+/// Run a single search test and return (total_nodes, total_micros, depth7_nodes, depth7_micros)
+fn run_single_search_test(max_depth: usize) -> (u128, u128, u64, u128) {
     let mut game = GameState::new();
     game.setup_standard_chess();
 
-    println!("Initial Board Setup: Standard Chess");
-    println!("----------------------------------------------------------------");
-
-    let max_depth = 7;
-    let mut last_duration = None;
-
-    let mut total_search_nodes: u128 = 0;
-    let mut total_search_micros: u128 = 0;
+    let mut total_nodes: u128 = 0;
+    let mut total_micros: u128 = 0;
+    let mut depth7_nodes: u64 = 0;
+    let mut depth7_micros: u128 = 0;
 
     for depth in 1..=max_depth {
         let search_start = Instant::now();
         let searched_nodes = negamax_node_count_for_depth(&mut game, depth);
-        let search_duration = search_start.elapsed();
-        let search_micros = search_duration.as_micros().max(1);
-        let search_nps = (searched_nodes as u128 * 1_000_000) / search_micros;
+        let search_micros = search_start.elapsed().as_micros().max(1);
 
-        total_search_nodes += searched_nodes as u128;
-        total_search_micros += search_micros;
+        total_nodes += searched_nodes as u128;
+        total_micros += search_micros;
 
-        println!(
-            "Depth {}: searched {:10} | Time: {:?} | NPS: {:10}",
-            depth,
-            searched_nodes,
-            search_duration,
-            search_nps
-        );
-
-        last_duration = Some(search_duration);
+        if depth == max_depth {
+            depth7_nodes = searched_nodes;
+            depth7_micros = search_micros;
+        }
     }
+
+    (total_nodes, total_micros, depth7_nodes, depth7_micros)
+}
+
+#[test]
+fn run_search_only_suite() {
+    println!("\n================================================================");
+    println!("Running Search-Only Suite for HydroChess (5 parallel runs, averaged)");
+    println!("================================================================");
+
+    const NUM_RUNS: usize = 5;
+    const MAX_DEPTH: usize = 6;
+
+    println!(
+        "Running {} sequential search tests to depth {}...",
+        NUM_RUNS, MAX_DEPTH
+    );
+    println!("----------------------------------------------------------------");
+
+    // Run tests sequentially to avoid CPU contention
+    let mut results: Vec<(u128, u128, u64, u128)> = Vec::with_capacity(NUM_RUNS);
+    for _ in 0..NUM_RUNS {
+        results.push(run_single_search_test(MAX_DEPTH));
+    }
+
+    // Calculate averages
+    let mut sum_total_nodes: u128 = 0;
+    let mut sum_total_micros: u128 = 0;
+    let mut sum_depth7_nodes: u128 = 0;
+    let mut sum_depth7_micros: u128 = 0;
+
+    for (i, (total_nodes, total_micros, d7_nodes, d7_micros)) in results.iter().enumerate() {
+        let nps = (*total_nodes * 1_000_000) / (*total_micros).max(1);
+        let d7_nps = (*d7_nodes as u128 * 1_000_000) / (*d7_micros).max(1);
+        println!(
+            "Run {}: total_nodes={:10} | total_time={:8}µs | NPS={:8} | D7_nodes={:8} | D7_NPS={:8}",
+            i + 1, total_nodes, total_micros, nps, d7_nodes, d7_nps
+        );
+        sum_total_nodes += *total_nodes;
+        sum_total_micros += *total_micros;
+        sum_depth7_nodes += *d7_nodes as u128;
+        sum_depth7_micros += *d7_micros;
+    }
+
+    let avg_total_nodes = sum_total_nodes / NUM_RUNS as u128;
+    let avg_total_micros = sum_total_micros / NUM_RUNS as u128;
+    let avg_depth7_nodes = sum_depth7_nodes / NUM_RUNS as u128;
+    let avg_depth7_micros = sum_depth7_micros / NUM_RUNS as u128;
+
+    let avg_nps = (avg_total_nodes * 1_000_000) / avg_total_micros.max(1);
+    let avg_d7_nps = (avg_depth7_nodes * 1_000_000) / avg_depth7_micros.max(1);
 
     println!("================================================================");
-    println!("Search-Only Performance Summary:");
-    if total_search_micros > 0 {
-        let avg_search_nps = (total_search_nodes * 1_000_000) / total_search_micros.max(1);
-        println!("  Avg search NPS over depths 1..{}: {}", max_depth, avg_search_nps);
-    }
-    if let Some(duration_d_max) = last_duration {
-        println!("  Depth {} search completed in {:?}", max_depth, duration_d_max);
-    }
+    println!("AVERAGED RESULTS ({} runs):", NUM_RUNS);
+    println!(
+        "  Avg total nodes (depths 1-{}): {}",
+        MAX_DEPTH, avg_total_nodes
+    );
+    println!(
+        "  Avg total time: {}µs ({:.2}s)",
+        avg_total_micros,
+        avg_total_micros as f64 / 1_000_000.0
+    );
+    println!("  Avg NPS: {}", avg_nps);
+    println!("  Avg Depth {} nodes: {}", MAX_DEPTH, avg_depth7_nodes);
+    println!(
+        "  Avg Depth {} time: {}µs ({:.2}s)",
+        MAX_DEPTH,
+        avg_depth7_micros,
+        avg_depth7_micros as f64 / 1_000_000.0
+    );
+    println!("  Avg Depth {} NPS: {}", MAX_DEPTH, avg_d7_nps);
     println!("================================================================");
 }

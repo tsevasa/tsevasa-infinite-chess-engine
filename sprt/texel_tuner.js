@@ -26,28 +26,50 @@ const TEXEL_CONFIG = {
   minStepFraction: 0.25,
 };
 
-// Only non-piece, non-endgame parameters that still exist in EvalFeatures / evaluation.rs
-// are tunable here.
-const TUNABLE_PARAMS = [
-  { name: 'king_ring_missing_penalty', step: 6, min: 0, max: 120 },
-  { name: 'king_open_ray_penalty', step: 2, min: 0, max: 40 },
-  { name: 'king_enemy_slider_penalty', step: 4, min: 0, max: 80 },
+// Instead of a hardcoded whitelist of tunable parameters, we infer tunable
+// params from the feature names present in the dataset and evaluation.rs.
+// This allows new eval constants / features to be added without updating
+// this script, as long as evaluation.rs exposes a matching const.
 
-  { name: 'dev_queen_back_rank_penalty', step: 4, min: 0, max: 100 },
-  { name: 'dev_rook_back_rank_penalty', step: 2, min: 0, max: 80 },
-  { name: 'dev_minor_back_rank_penalty', step: 2, min: 0, max: 60 },
+// Blacklist of parameter names that should never be tuned, even if features
+// with these names exist. This includes all piece values and any other
+// structural parameters you want to keep fixed.
+const PARAM_BLACKLIST = new Set([
+  // Piece values
+  'pawn_value',
+  'knight_value',
+  'bishop_value',
+  'rook_value',
+  'queen_value',
+  'king_value',
+  'guard_value',
+  'royal_queen_value',
 
-  { name: 'rook_idle_penalty', step: 2, min: 0, max: 60 },
+  'giraffe_value',
+  'camel_value',
+  'zebra_value',
 
-  { name: 'slider_mobility_bonus', step: 1, min: 0, max: 16 },
-  { name: 'bishop_mobility_bonus', step: 1, min: 0, max: 16 },
+  'knightrider_value',
+  'amazon_value',
+  'hawk_value',
+  'chancellor_value',
+  'archbishop_value',
+  'centaur_value',
+  'royal_centaur_value',
 
-  { name: 'doubled_pawn_penalty', step: 1, min: 0, max: 40 },
+  'rose_value',
+  'huygen_value',
+]);
 
-  { name: 'bishop_pair_bonus', step: 4, min: 0, max: 120 },
-  { name: 'queen_too_close_to_king_penalty', step: 4, min: 0, max: 120 },
-  { name: 'queen_fork_zone_bonus', step: 2, min: 0, max: 60 },
-];
+// Optional per-parameter overrides for step/min/max when the generic
+// heuristic is not appropriate. Keys are feature/parameter names.
+const PARAM_RANGE_OVERRIDES = {
+  // Example:
+  // king_ring_missing_penalty: { step: 4, min: 0, max: 120 },
+};
+
+// Filled at runtime by buildTunableParams based on dataset features.
+let TUNABLE_PARAMS = [];
 
 // Utility to map parameter names (king_ring_pawn_bonus) to Rust const names (KING_RING_PAWN_BONUS).
 function toConstName(name) {
@@ -152,13 +174,71 @@ function loadDefaultsFromEvaluation() {
     huygen_value,
   };
 
-  // Positional parameters from const definitions for each tunable param.
-  for (const spec of TUNABLE_PARAMS) {
-    const constName = toConstName(spec.name);
-    params[spec.name] = extractConstInt(text, constName);
+  return params;
+}
+
+// Infer tunable parameters from dataset feature names and evaluation.rs
+// consts. For each feature f[name], if there is a corresponding
+// const NAME: i32 = ... in evaluation.rs and the name is not blacklisted,
+// we treat it as a tunable parameter.
+function buildTunableParams(params, samples) {
+  const text = fs.readFileSync(EVAL_FILE, 'utf8');
+
+  const featureNames = new Set();
+  for (const s of samples) {
+    const f = s.features || {};
+    for (const name of Object.keys(f)) {
+      featureNames.add(name);
+    }
   }
 
-  return params;
+  const specs = [];
+
+  for (const name of featureNames) {
+    if (PARAM_BLACKLIST.has(name)) {
+      continue;
+    }
+
+    const constName = toConstName(name);
+    let defaultValue;
+    try {
+      defaultValue = extractConstInt(text, constName);
+    } catch (e) {
+      // No matching const in evaluation.rs; skip this feature.
+      continue;
+    }
+
+    // Seed params with the default value from evaluation.rs so that
+    // baseline eval matches the current engine.
+    if (typeof params[name] !== 'number') {
+      params[name] = defaultValue;
+    }
+
+    const override = PARAM_RANGE_OVERRIDES[name] || {};
+    let step = override.step;
+    let min = override.min;
+    let max = override.max;
+
+    if (typeof step !== 'number' || typeof min !== 'number' || typeof max !== 'number') {
+      const abs = Math.abs(defaultValue) || 1;
+      step = Math.max(1, Math.round(abs / 4));
+      const span = abs * 4;
+      if (defaultValue >= 0) {
+        min = 0;
+        max = defaultValue + span;
+      } else {
+        min = defaultValue - span;
+        max = defaultValue + span;
+      }
+    }
+
+    specs.push({ name, step, min, max });
+  }
+
+  // Stable order for deterministic tuning runs.
+  specs.sort((a, b) => a.name.localeCompare(b.name));
+  TUNABLE_PARAMS = specs;
+  return specs;
 }
 
 function loadDataset() {
@@ -283,6 +363,14 @@ async function main() {
 
   const defaultParams = loadDefaultsFromEvaluation();
   const params = { ...defaultParams };
+  // Infer tunable params from dataset + evaluation.rs and seed params with
+  // their default const values.
+  buildTunableParams(params, used);
+
+  if (!TUNABLE_PARAMS.length) {
+    throw new Error('No tunable parameters inferred from dataset features.');
+  }
+
   let bestLoss = evaluateLoss(params, used, TEXEL_CONFIG);
   const baselineAvg = bestLoss / used.length;
   console.log(

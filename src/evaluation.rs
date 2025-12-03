@@ -116,7 +116,10 @@ const DEV_ROOK_BACK_RANK_PENALTY: i32 = 18;
 const DEV_MINOR_BACK_RANK_PENALTY: i32 = 10;
 
 // Rook heuristics
-const ROOK_IDLE_PENALTY: i32 = 12;
+// Slightly increased based on Texel tuning (optimum around ~37), but kept
+// moderate so rooks are encouraged to activate without over-penalizing
+// reasonable defensive placements.
+const ROOK_IDLE_PENALTY: i32 = 20;
 
 // King attack heuristics - back near original scale
 // These should be impactful but not dominate material.
@@ -125,10 +128,12 @@ const KING_TROPISM_BONUS: i32 = 4;
 const KNIGHT_NEAR_KING_BONUS: i32 = 15;
 const SLIDER_NET_BONUS: i32 = 20;
 
-// King safety ring and ray penalties - slightly stronger than original
+// King safety ring and ray penalties - slightly stronger than original.
+// Enemy slider penalty is bumped up toward the Texel suggestion (~75) but
+// kept below that to remain in line with other positional terms.
 const KING_RING_MISSING_PENALTY: i32 = 30;
 const KING_OPEN_RAY_PENALTY: i32 = 10;
-const KING_ENEMY_SLIDER_PENALTY: i32 = 15;
+const KING_ENEMY_SLIDER_PENALTY: i32 = 40;
 
 // King pawn shield heuristics (mild influence only)
 // Reward having pawns in front of the king and penalize the king walking
@@ -140,10 +145,19 @@ const KING_PAWN_AHEAD_PENALTY: i32 = 20;
 const SLIDER_MOBILITY_BONUS: i32 = 1; // Used only for queen/bishop mobility
 const BISHOP_MOBILITY_BONUS: i32 = 1;
 
-// Distance penalties to discourage sliders far away from the enemy king
-const FAR_SLIDER_CHEB_RADIUS: i64 = 20;
-const FAR_QUEEN_PENALTY: i32 = 2;
-const FAR_BISHOP_PENALTY: i32 = 1;
+// Distance penalties to discourage sliders far away from the king "zone".
+// We look at distance to both own and enemy king and penalize pieces that
+// drift too far from either.
+const FAR_SLIDER_CHEB_RADIUS: i64 = 18;
+const FAR_SLIDER_CHEB_MAX_EXCESS: i64 = 40;
+const FAR_QUEEN_PENALTY: i32 = 3;
+const FAR_BISHOP_PENALTY: i32 = 2;
+const FAR_ROOK_PENALTY: i32 = 2;
+const PIECE_CLOUD_CHEB_RADIUS: i64 = 16;
+const PIECE_CLOUD_CHEB_MAX_EXCESS: i64 = 64;
+const QUEEN_CLOUD_PENALTY: i32 = 1;
+const ROOK_CLOUD_PENALTY: i32 = 1;
+const BISHOP_CLOUD_PENALTY: i32 = 1;
 
 // Pawn structure
 const DOUBLED_PAWN_PENALTY: i32 = 8;
@@ -234,6 +248,28 @@ fn evaluate_pieces(
     let mut white_bishop_colors: (bool, bool) = (false, false); // (light, dark)
     let mut black_bishop_colors: (bool, bool) = (false, false);
 
+    let mut cloud_center: Option<Coordinate> = None;
+    {
+        let mut sum_x: i64 = 0;
+        let mut sum_y: i64 = 0;
+        let mut count: i64 = 0;
+
+        for ((x, y), piece) in &game.board.pieces {
+            if piece.piece_type != PieceType::Void && piece.piece_type != PieceType::Obstacle {
+                sum_x += *x;
+                sum_y += *y;
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            cloud_center = Some(Coordinate {
+                x: sum_x / count,
+                y: sum_y / count,
+            });
+        }
+    }
+
     for ((x, y), piece) in &game.board.pieces {
         let mut piece_score = match piece.piece_type {
             PieceType::Rook => evaluate_rook(game, *x, *y, piece.color, white_king, black_king),
@@ -260,6 +296,23 @@ fn evaluate_pieces(
             PieceType::Pawn => evaluate_pawn_position(*x, *y, piece.color),
             _ => 0,
         };
+
+        if let Some(center) = &cloud_center {
+            let cheb = (*x - center.x).abs().max((*y - center.y).abs());
+            if cheb > PIECE_CLOUD_CHEB_RADIUS {
+                let excess =
+                    (cheb - PIECE_CLOUD_CHEB_RADIUS).min(PIECE_CLOUD_CHEB_MAX_EXCESS) as i32;
+                let penalty = match piece.piece_type {
+                    PieceType::Queen | PieceType::RoyalQueen => QUEEN_CLOUD_PENALTY,
+                    PieceType::Rook | PieceType::Chancellor | PieceType::Amazon => {
+                        ROOK_CLOUD_PENALTY
+                    }
+                    PieceType::Bishop | PieceType::Archbishop => BISHOP_CLOUD_PENALTY,
+                    _ => 0,
+                };
+                piece_score -= excess * penalty;
+            }
+        }
 
         // Development penalty: encourage higher-value pieces to leave back rank first.
         let back_rank = if piece.color == PlayerColor::White {
@@ -384,6 +437,25 @@ fn evaluate_rook(
         };
 
         bonus += nearby_slider_bonus;
+
+        // Penalize rooks that have drifted very far from the king zone (both
+        // own and enemy kings). On an infinite board, there is rarely value
+        // in a rook being dozens of squares away from *both* kings.
+        let mut cheb = (x - ek.x).abs().max((y - ek.y).abs());
+        let own_king_ref = if color == PlayerColor::White {
+            white_king
+        } else {
+            black_king
+        };
+        if let Some(ok) = own_king_ref {
+            let cheb_own = (x - ok.x).abs().max((y - ok.y).abs());
+            cheb = cheb.min(cheb_own);
+        }
+
+        if cheb > FAR_SLIDER_CHEB_RADIUS {
+            let excess = (cheb - FAR_SLIDER_CHEB_RADIUS).min(FAR_SLIDER_CHEB_MAX_EXCESS) as i32;
+            bonus -= excess * FAR_ROOK_PENALTY;
+        }
     }
 
     // Penalize completely idle rooks stuck behind both own and enemy pawns on their file.
@@ -453,10 +525,22 @@ fn evaluate_queen(
         let manhattan_weight = (KING_TROPISM_BONUS / 2).max(1);
         bonus += manhattan_score * manhattan_weight;
 
-        // Penalize queens that are extremely far from the enemy king.
-        let cheb = (x - ek.x).abs().max((y - ek.y).abs());
+        // Penalize queens that are extremely far from the *king zone*.
+        // We take the minimum Chebyshev distance to own and enemy kings so
+        // that wandering far away from both is discouraged.
+        let mut cheb = (x - ek.x).abs().max((y - ek.y).abs());
+        let own_king_ref = if color == PlayerColor::White {
+            white_king
+        } else {
+            black_king
+        };
+        if let Some(ok) = own_king_ref {
+            let cheb_own = (x - ok.x).abs().max((y - ok.y).abs());
+            cheb = cheb.min(cheb_own);
+        }
+
         if cheb > FAR_SLIDER_CHEB_RADIUS {
-            let excess = (cheb - FAR_SLIDER_CHEB_RADIUS).min(32) as i32;
+            let excess = (cheb - FAR_SLIDER_CHEB_RADIUS).min(FAR_SLIDER_CHEB_MAX_EXCESS) as i32;
             bonus -= excess * FAR_QUEEN_PENALTY;
         }
     }
@@ -583,10 +667,21 @@ fn evaluate_bishop(
         let trop = (15 - capped) as i32;
         bonus += trop * (KING_TROPISM_BONUS / 2).max(1);
 
-        // Penalize bishops that are extremely far from the enemy king.
-        let cheb = (x - ek.x).abs().max((y - ek.y).abs());
+        // Penalize bishops that are extremely far from the king zone
+        // (minimum of distance to own and enemy kings).
+        let mut cheb = (x - ek.x).abs().max((y - ek.y).abs());
+        let own_king_ref = if color == PlayerColor::White {
+            white_king
+        } else {
+            black_king
+        };
+        if let Some(ok) = own_king_ref {
+            let cheb_own = (x - ok.x).abs().max((y - ok.y).abs());
+            cheb = cheb.min(cheb_own);
+        }
+
         if cheb > FAR_SLIDER_CHEB_RADIUS {
-            let excess = (cheb - FAR_SLIDER_CHEB_RADIUS).min(32) as i32;
+            let excess = (cheb - FAR_SLIDER_CHEB_RADIUS).min(FAR_SLIDER_CHEB_MAX_EXCESS) as i32;
             bonus -= excess * FAR_BISHOP_PENALTY;
         }
     }

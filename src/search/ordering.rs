@@ -13,9 +13,24 @@ const SORT_LOSING_CAPTURE: i32 = 0;
 const SORT_QUIET: i32 = 0;
 const SORT_KILLER1: i32 = 900_000;
 const SORT_KILLER2: i32 = 800_000;
+const SORT_COUNTERMOVE: i32 = 600_000;
 
 // Move ordering helpers
-pub fn sort_moves(searcher: &Searcher, game: &GameState, moves: &mut Vec<Move>, ply: usize, tt_move: &Option<Move>) {
+pub fn sort_moves(
+    searcher: &Searcher,
+    game: &GameState,
+    moves: &mut Vec<Move>,
+    ply: usize,
+    tt_move: &Option<Move>,
+) {
+    // Get previous move info for countermove lookup, indexed by hashed
+    // from/to squares as in the classic counter-move heuristic.
+    let (prev_from_hash, prev_to_hash) = if ply > 0 {
+        searcher.prev_move_stack[ply - 1]
+    } else {
+        (0, 0)
+    };
+
     moves.sort_by_cached_key(|m| {
         let mut score: i32 = 0;
 
@@ -44,15 +59,32 @@ pub fn sort_moves(searcher: &Searcher, game: &GameState, moves: &mut Vec<Move>, 
                 score += SORT_LOSING_CAPTURE;
             }
 
-            let cap_hist = searcher.capture_history[m.piece.piece_type as usize][target.piece_type as usize];
+            let cap_hist =
+                searcher.capture_history[m.piece.piece_type as usize][target.piece_type as usize];
             score += cap_hist / 10;
         } else {
-            // Quiet move: killers + history, similar to Zig's ordering.
-            if searcher.killers[ply][0].as_ref().map_or(false, |k| m.from == k.from && m.to == k.to && m.promotion == k.promotion) {
+            // Quiet move: killers + countermove + history
+            if searcher.killers[ply][0].as_ref().map_or(false, |k| {
+                m.from == k.from && m.to == k.to && m.promotion == k.promotion
+            }) {
                 score += SORT_KILLER1;
-            } else if searcher.killers[ply][1].as_ref().map_or(false, |k| m.from == k.from && m.to == k.to && m.promotion == k.promotion) {
+            } else if searcher.killers[ply][1].as_ref().map_or(false, |k| {
+                m.from == k.from && m.to == k.to && m.promotion == k.promotion
+            }) {
                 score += SORT_KILLER2;
             } else {
+                // Check if this is the countermove for the previous move
+                if ply > 0 && prev_from_hash < 256 && prev_to_hash < 256 {
+                    let (cm_piece, cm_to_x, cm_to_y) =
+                        searcher.countermoves[prev_from_hash][prev_to_hash];
+                    if cm_piece != 0
+                        && cm_piece == m.piece.piece_type as u8
+                        && cm_to_x == m.to.x as i16
+                        && cm_to_y == m.to.y as i16
+                    {
+                        score += SORT_COUNTERMOVE;
+                    }
+                }
                 score += SORT_QUIET;
             }
 
@@ -66,7 +98,12 @@ pub fn sort_moves(searcher: &Searcher, game: &GameState, moves: &mut Vec<Move>, 
     });
 }
 
-pub fn sort_moves_root(searcher: &Searcher, game: &GameState, moves: &mut Vec<Move>, tt_move: &Option<Move>) {
+pub fn sort_moves_root(
+    searcher: &Searcher,
+    game: &GameState,
+    moves: &mut Vec<Move>,
+    tt_move: &Option<Move>,
+) {
     sort_moves(searcher, game, moves, 0, tt_move);
 }
 
@@ -84,4 +121,9 @@ pub fn sort_captures(game: &GameState, moves: &mut Vec<Move>) {
 #[inline]
 pub fn hash_move_dest(m: &Move) -> usize {
     ((m.to.x ^ m.to.y) & 0xFF) as usize
+}
+
+#[inline]
+pub fn hash_move_from(m: &Move) -> usize {
+    ((m.from.x ^ m.from.y) & 0xFF) as usize
 }

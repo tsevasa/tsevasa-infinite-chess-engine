@@ -1,0 +1,224 @@
+name: SPRT CI
+
+on:
+  push:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+  workflow_dispatch: {}
+
+jobs:
+  sprt-ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: |
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh -s -- -y
+
+      - name: Cache wasm-pack binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+          cache-dependency-path: sprt/package-lock.json
+
+      - name: Install SPRT dependencies
+        working-directory: sprt
+        run: npm ci
+
+      - name: Build OLD web engine from previous commit
+        id: build_old
+        run: |
+          set -e
+          if ! git rev-parse HEAD^ >/dev/null 2>&1; then
+            echo "No previous commit detected; skipping SPRT comparison."
+            echo "has_parent=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          OLD_COMMIT=$(git rev-parse HEAD^)
+          echo "Building OLD web engine from commit $OLD_COMMIT"
+
+          OLD_WORKTREE="$(mktemp -d)"
+          git worktree add "$OLD_WORKTREE" "$OLD_COMMIT"
+
+          (
+            cd "$OLD_WORKTREE"
+            wasm-pack build --target web --out-dir "$GITHUB_WORKSPACE/pkg-old"
+          )
+
+          git worktree remove "$OLD_WORKTREE" --force
+
+          echo "has_parent=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install Chrome dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          (sudo apt-get update || apt-get update)
+          (sudo apt-get install -y \
+            libnss3 libnspr4 \
+            libatk1.0-0 libatk-bridge2.0-0 \
+            libgtk-3-0 \
+            libdrm2 \
+            libgbm1 \
+            libx11-6 libxcb1 libxcomposite1 libxdamage1 libxrandr2 libxext6 libxfixes3 libxkbcommon0 \
+            libpango-1.0-0 libasound2t64 \
+            || apt-get install -y \
+            libnss3 libnspr4 \
+            libatk1.0-0 libatk-bridge2.0-0 \
+            libgtk-3-0 \
+            libdrm2 \
+            libgbm1 \
+            libx11-6 libxcb1 libxcomposite1 libxdamage1 libxrandr2 libxext6 libxfixes3 libxkbcommon0 \
+            libpango-1.0-0 libasound2t64)
+
+      - name: Run SPRT CI (HEAD vs previous)
+        if: steps.build_old.outputs.has_parent == 'true'
+        working-directory: sprt
+        env:
+          SPRT_CI_GAMES: 100
+          SPRT_CI_CONCURRENCY: 2
+          SPRT_CI_TC: "5+0.05"
+        run: node run_sprt_ci.js
+
+      - name: Upload SPRT CI result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sprt-ci-result
+          path: sprt/ci_result.json
+
+      - name: Write SPRT summary to check
+        if: always()
+        run: |
+          if [ ! -f sprt/ci_result.json ]; then
+            echo "No SPRT CI result found" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          node - << 'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const resultPath = path.join(process.cwd(), 'sprt', 'ci_result.json');
+          const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+          if (!fs.existsSync(resultPath) || !summaryPath) {
+            process.exit(0);
+          }
+          const data = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+          const lines = [];
+          lines.push('### SPRT CI (HEAD vs previous commit)');
+          lines.push('');
+          if (data.verdict) {
+            lines.push(`Verdict: **${data.verdict}**`);
+            lines.push('');
+          }
+          if (typeof data.elo === 'number') {
+            const elo = data.elo;
+            const err = typeof data.eloError === 'number' ? data.eloError : 0;
+            const lower = elo - err;
+            const upper = elo + err;
+            let heuristic = 'roughly equal';
+            if (lower > 50) {
+              heuristic = 'probably better';
+            } else if (lower > 0) {
+              heuristic = 'slightly better';
+            } else if (upper < -50) {
+              heuristic = 'probably worse';
+            } else if (upper < 0) {
+              heuristic = 'slightly worse';
+            }
+            lines.push(`Heuristic verdict (short run): **${heuristic}**`);
+            lines.push('');
+          }
+          lines.push(`Games: ${data.games}  (W:${data.wins} L:${data.losses} D:${data.draws})`);
+          if (typeof data.elo === 'number') {
+            const eloStr = data.elo >= 0 ? `+${data.elo.toFixed(1)}` : data.elo.toFixed(1);
+            const errStr = typeof data.eloError === 'number' ? data.eloError.toFixed(1) : 'n/a';
+            lines.push(`Estimated Elo: ${eloStr} +/- ${errStr}`);
+          }
+          lines.push('');
+          if (data.logSummary) {
+            lines.push('```text');
+            lines.push(data.logSummary);
+            lines.push('```');
+          }
+          fs.appendFileSync(summaryPath, lines.join('\n') + '\n');
+          EOF
+
+      - name: Comment SPRT result on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const resultPath = path.join(process.env.GITHUB_WORKSPACE, 'sprt', 'ci_result.json');
+            if (!fs.existsSync(resultPath)) {
+              return;
+            }
+            const data = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+            const lines = [];
+            lines.push('### SPRT CI (HEAD vs previous commit)');
+            lines.push('');
+            if (data.verdict) {
+              lines.push(`Verdict: **${data.verdict}**`);
+              lines.push('');
+            }
+            if (typeof data.elo === 'number') {
+              const elo = data.elo;
+              const err = typeof data.eloError === 'number' ? data.eloError : 0;
+              const lower = elo - err;
+              const upper = elo + err;
+              let heuristic = 'roughly equal';
+              if (lower > 50) {
+                heuristic = 'probably better';
+              } else if (lower > 0) {
+                heuristic = 'slightly better';
+              } else if (upper < -50) {
+                heuristic = 'probably worse';
+              } else if (upper < 0) {
+                heuristic = 'slightly worse';
+              }
+              lines.push(`Heuristic verdict (short run): **${heuristic}**`);
+              lines.push('');
+            }
+            lines.push(`Games: ${data.games}  (W:${data.wins} L:${data.losses} D:${data.draws})`);
+            if (typeof data.elo === 'number') {
+              const eloStr = data.elo >= 0 ? `+${data.elo.toFixed(1)}` : data.elo.toFixed(1);
+              const errStr = typeof data.eloError === 'number' ? data.eloError.toFixed(1) : 'n/a';
+              lines.push(`Estimated Elo: ${eloStr} +/- ${errStr}`);
+            }
+            lines.push('');
+            if (data.logSummary) {
+              lines.push('```text');
+              lines.push(data.logSummary);
+              lines.push('```');
+            }
+            const body = lines.join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });

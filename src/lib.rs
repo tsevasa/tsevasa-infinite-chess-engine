@@ -57,6 +57,8 @@ struct JsFullGame {
     game_rules: Option<JsGameRules>,
     #[serde(default)]
     world_bounds: Option<JsWorldBounds>,
+    #[serde(default)]
+    clock: Option<JsClock>,
 }
 
 #[derive(Deserialize, Default)]
@@ -79,6 +81,18 @@ struct JsWorldBounds {
     right: String,
     bottom: String,
     top: String,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+struct JsClock {
+    /// Remaining time for White in milliseconds
+    wtime: u64,
+    /// Remaining time for Black in milliseconds
+    btime: u64,
+    /// Increment for White in milliseconds
+    winc: u64,
+    /// Increment for Black in milliseconds
+    binc: u64,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +132,7 @@ struct JsEvalWithFeatures {
 #[wasm_bindgen]
 pub struct Engine {
     game: GameState,
+    clock: Option<JsClock>,
 }
 
 #[wasm_bindgen]
@@ -284,7 +299,10 @@ impl Engine {
             // updated naturally by make_move_coords.
         }
 
-        Ok(Engine { game })
+        // Optional clock information (similar to UCI wtime/btime/winc/binc).
+        let clock = js_game.clock;
+
+        Ok(Engine { game, clock })
     }
 
     pub fn get_best_move(&mut self) -> JsValue {
@@ -330,11 +348,125 @@ impl Engine {
         evaluation::evaluate(&self.game)
     }
 
+    /// Derive an effective time limit for this move from the current clock and
+    /// game state. When a clock is present (timed game), we ignore the
+    /// caller-provided fixed per-move limit and instead base the allocation on
+    /// remaining time, increment, and a simple game-phase heuristic.
+    ///
+    /// When no clock is present (infinite/untimed), we fall back to the
+    /// requested per-move limit.
+    fn effective_time_limit_ms(&self, requested_limit_ms: u32) -> u128 {
+        let Some(clock) = self.clock else {
+            // No clock info: respect the fixed per-move limit.
+            return requested_limit_ms as u128;
+        };
+
+        // Decide which side's clock to use.
+        let (remaining_ms_raw, inc_ms_raw) = match self.game.turn {
+            PlayerColor::White => (clock.wtime, clock.winc),
+            PlayerColor::Black => (clock.btime, clock.binc),
+            // Neutral side-to-move should not normally happen; fall back to
+            // the requested limit in that case.
+            PlayerColor::Neutral => return requested_limit_ms as u128,
+        };
+
+        // If there is no usable clock information, fall back to the
+        // requested fixed limit.
+        if remaining_ms_raw == 0 && inc_ms_raw == 0 {
+            return requested_limit_ms as u128;
+        }
+
+        // Treat a zero remaining time but positive increment as a very short
+        // remaining time budget based mostly on the increment.
+        let remaining_ms = if remaining_ms_raw > 0 {
+            remaining_ms_raw
+        } else {
+            // At least give ourselves a small buffer.
+            inc_ms_raw.max(500)
+        };
+
+        let inc_ms = inc_ms_raw;
+
+        // Crude game phase estimation based on total material count. This
+        // does not need to be exact; it only guides relative time allocation.
+        let total_pieces: u32 =
+            (self.game.white_piece_count as u32).saturating_add(self.game.black_piece_count as u32);
+
+        // Opening: many pieces on the board -> be conservative.
+        // Middlegame: spend more.
+        // Endgame: spend the most per move (within reason).
+        let (moves_to_go, phase_factor): (u64, f64) = if total_pieces > 20 {
+            (30, 0.7)
+        } else if total_pieces > 10 {
+            (20, 1.0)
+        } else {
+            (10, 1.2)
+        };
+
+        let moves_to_go = moves_to_go.max(5);
+        let base_per_move = (remaining_ms / moves_to_go).max(10);
+        let phase_scaled = (base_per_move as f64 * phase_factor) as u64;
+        let inc_contrib = inc_ms / 2;
+
+        let mut alloc = phase_scaled.saturating_add(inc_contrib);
+
+        // Hard caps:
+        //  - never spend more than half of the remaining time on a single move
+        //  - global cap to keep engine thinking time reasonable in the browser
+        let hard_cap_by_remaining = remaining_ms / 2;
+        let global_cap_ms: u64 = 15_000; // 15 seconds
+        let mut hard_cap = hard_cap_by_remaining.min(global_cap_ms);
+
+        // Ensure the cap is not unreasonably tiny when we still have some time.
+        if hard_cap < 250 {
+            hard_cap = 250;
+        }
+
+        if alloc > hard_cap {
+            alloc = hard_cap;
+        }
+
+        // Do not go below a tiny minimum, but also don't exceed the sum of
+        // remaining time and one increment.
+        let min_think_ms: u64 = 50;
+        if alloc < min_think_ms {
+            alloc = min_think_ms;
+        }
+
+        let max_reasonable = remaining_ms.saturating_add(inc_ms);
+        if alloc > max_reasonable {
+            alloc = max_reasonable.max(min_think_ms);
+        }
+
+        alloc as u128
+    }
+
     /// Timed search. This also exposes the search evaluation as an `eval` field alongside the move,
     /// so callers can reuse the same search for adjudication.
     pub fn get_best_move_with_time(&mut self, time_limit_ms: u32) -> JsValue {
+        let effective_limit = self.effective_time_limit_ms(time_limit_ms);
+        #[cfg(target_arch = "wasm32")]
+        {
+            use crate::log;
+            if let Some(clock) = self.clock {
+                let side = match self.game.turn {
+                    PlayerColor::White => "w",
+                    PlayerColor::Black => "b",
+                    PlayerColor::Neutral => "n",
+                };
+                log(&format!(
+                    "info timealloc side {} wtime {} btime {} winc {} binc {} limit {}",
+                    side, clock.wtime, clock.btime, clock.winc, clock.binc, effective_limit
+                ));
+            } else {
+                log(&format!(
+                    "info timealloc no_clock requested_limit {} effective_limit {}",
+                    time_limit_ms, effective_limit
+                ));
+            }
+        }
         if let Some((best_move, eval)) =
-            search::get_best_move_timed_with_eval(&mut self.game, 50, time_limit_ms as u128, false)
+            search::get_best_move_timed_with_eval(&mut self.game, 50, effective_limit, false)
         {
             let js_move = JsMoveWithEval {
                 from: format!("{},{}", best_move.from.x, best_move.from.y),

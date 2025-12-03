@@ -8,6 +8,7 @@
     "dev": "node sprt.js",
     "gen-dataset": "node gen_dataset.js",
     "tune": "node texel_tuner.js",
+    "sprt-ci": "node run_sprt_ci.js",
     "apply-tune": "node apply_tuned_params.js"
   },
   "keywords": ["chess", "engine", "sprt", "testing"],

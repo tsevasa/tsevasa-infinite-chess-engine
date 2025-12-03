@@ -25,7 +25,7 @@ pub const THINK_TIME_MS: u128 = 3000; // 3 seconds per move (default, may be ove
 // perspective. This discourages pointless repetitions when equal or better
 // continuations exist, but is small enough that the engine will still accept
 // a draw in worse positions.
-const REPETITION_PENALTY: i32 = 4;
+const REPETITION_PENALTY: i32 = 8;
 
 // Maximum absolute value for history scores (used by gravity-style updates)
 const MAX_HISTORY: i32 = 4000;
@@ -55,15 +55,11 @@ const ASPIRATION_WINDOW: i32 = 50;
 // Futility pruning margins
 const FUTILITY_MARGIN: [i32; 4] = [0, 100, 200, 300];
 
-// Internal Iterative Deepening
-const IID_MIN_DEPTH: usize = 4;
-const IID_REDUCTION: usize = 2;
-
 mod tt;
 pub use tt::{TTEntry, TTFlag, TranspositionTable};
 
 mod ordering;
-use ordering::{hash_move_dest, sort_captures, sort_moves, sort_moves_root};
+use ordering::{hash_move_dest, hash_move_from, sort_captures, sort_moves, sort_moves_root};
 
 mod see;
 pub(crate) use see::static_exchange_eval_impl as static_exchange_eval;
@@ -144,6 +140,14 @@ pub struct Searcher {
     // Used to improve capture ordering beyond pure MVV-LVA
     pub capture_history: [[i32; 32]; 32],
 
+    // Countermove heuristic [prev_from_hash][prev_to_hash] -> (piece_type, to_x, to_y)
+    // Stores the move that refuted the previous move (for quiet beta cutoffs).
+    // Using (u8, i16, i16) to store piece type and destination coords.
+    pub countermoves: [[(u8, i16, i16); 256]; 256],
+
+    // Previous move info for countermove heuristic (from_hash, to_hash)
+    pub prev_move_stack: Vec<(usize, usize)>,
+
     // Static eval stack for "improving" heuristic
     // Stores eval at each ply to detect if position is improving
     pub eval_stack: Vec<i32>,
@@ -195,6 +199,8 @@ impl Searcher {
             killers,
             history: [[0; 256]; 32],
             capture_history: [[0; 32]; 32],
+            countermoves: [[(0, 0, 0); 256]; 256],
+            prev_move_stack: vec![(0, 0); MAX_PLY],
             eval_stack: vec![0; MAX_PLY],
             best_move_root: None,
             prev_score: 0,
@@ -381,12 +387,17 @@ pub fn get_best_move_timed_with_eval(
             let undo = game.make_move(m);
             let legal = !game.is_move_illegal();
             game.undo_move(m, undo);
+
             legal
         })
         .cloned();
 
     let mut best_move: Option<Move> = fallback_move.clone();
     let mut best_score = -INFINITY;
+    let mut stability: usize = 0;
+    let mut prev_iter_score: i32 = 0;
+    let mut has_prev_iter_score = false;
+    let mut prev_root_move_coords: Option<(i64, i64, i64, i64)> = None;
 
     // Iterative deepening with aspiration windows
     for depth in 1..=max_depth {
@@ -446,9 +457,20 @@ pub fn get_best_move_timed_with_eval(
             best_score = score;
             searcher.best_move_root = Some(pv_move.clone());
             searcher.prev_score = score;
+
+            let coords = (pv_move.from.x, pv_move.from.y, pv_move.to.x, pv_move.to.y);
+            if let Some(prev_coords) = prev_root_move_coords {
+                if prev_coords == coords {
+                    stability += 1;
+                } else {
+                    stability = 0;
+                }
+            } else {
+                stability = 0;
+            }
+            prev_root_move_coords = Some(coords);
         }
 
-        // Print info after each depth (even if stopped, for debugging)
         if !searcher.stopped && !searcher.silent {
             searcher.print_info(depth, score);
         }
@@ -460,7 +482,34 @@ pub fn get_best_move_timed_with_eval(
 
         // If we've used more than 50% of time, don't start another iteration
         if searcher.time_limit_ms != u128::MAX {
+            let elapsed = searcher.timer.elapsed_ms();
             let limit = searcher.time_limit_ms;
+
+            if best_move.is_some() {
+                let mut factor = 1.1_f64 - 0.03_f64 * (stability as f64);
+                if factor < 0.5 {
+                    factor = 0.5;
+                }
+
+                if has_prev_iter_score && best_score - prev_iter_score > ASPIRATION_WINDOW {
+                    factor *= 1.1;
+                }
+
+                if factor > 1.0 {
+                    factor = 1.0;
+                }
+
+                let ideal_ms = (limit as f64 * factor) as u128;
+                let soft_limit = std::cmp::min(limit, ideal_ms);
+
+                if elapsed >= soft_limit {
+                    break;
+                }
+
+                prev_iter_score = best_score;
+                has_prev_iter_score = true;
+            }
+
             let cutoff = if limit <= 300 {
                 // Very short thinks: keep ~50% heuristic
                 limit / 2
@@ -475,7 +524,7 @@ pub fn get_best_move_timed_with_eval(
                 limit.saturating_sub(2000)
             };
 
-            if searcher.timer.elapsed_ms() > cutoff {
+            if elapsed >= cutoff {
                 break;
             }
         }
@@ -490,6 +539,21 @@ pub fn get_best_move_timed_with_eval(
         None
     }
 }
+
+/// Time-limited search that also returns the final root score (cp from side-to-move's perspective).
+// pub fn get_best_move_timed_with_eval(
+//     game: &mut GameState,
+//     max_depth: usize,
+//     time_limit_ms: u128,
+//     silent: bool,
+// ) -> Option<(Move, i32)> {
+//     game.recompute_piece_counts();
+
+//     let mut searcher = Searcher::new(time_limit_ms);
+//     searcher.silent = silent;
+
+//     search_with_searcher(&mut searcher, game, max_depth)
+// }
 
 /// Time-limited search entry point. Delegates to the core
 /// get_best_move_timed_with_eval implementation and discards the eval.
@@ -556,6 +620,13 @@ fn negamax_root(
             continue;
         }
 
+        // At the root, this move becomes the previous move for child ply 1,
+        // stored as (from_hash, to_hash).
+        let prev_entry_backup = searcher.prev_move_stack[0];
+        let prev_from_hash = hash_move_from(m);
+        let prev_to_hash = hash_move_dest(m);
+        searcher.prev_move_stack[0] = (prev_from_hash, prev_to_hash);
+
         legal_moves += 1;
 
         // Save first legal move as fallback
@@ -577,6 +648,9 @@ fn negamax_root(
         }
 
         game.undo_move(m, undo);
+
+        // Restore previous-move stack entry for root after returning from child.
+        searcher.prev_move_stack[0] = prev_entry_backup;
 
         if searcher.stopped {
             return best_score;
@@ -699,13 +773,15 @@ fn negamax(
         return quiescence(searcher, game, ply, alpha, beta);
     }
 
+    // Depth may be adjusted by check extensions and internal iterative
+    // reductions (IIR). Start from the caller-provided depth.
+    let mut depth = depth;
+
     // Check extension (limited to avoid infinite recursion)
     // Only extend if we're not too deep already
-    let depth = if in_check && ply < MAX_PLY / 2 {
-        depth + 1
-    } else {
-        depth
-    };
+    if in_check && ply < MAX_PLY / 2 {
+        depth += 1;
+    }
     let mut tt_move: Option<Move> = None;
 
     if let Some((score, best)) = searcher.tt.probe(hash, alpha, beta, depth, ply) {
@@ -735,20 +811,13 @@ fn negamax(
         true // Assume improving at root or when in check
     };
 
-    // Internal Iterative Deepening - search with reduced depth if no TT move
-    if tt_move.is_none() && depth >= IID_MIN_DEPTH && is_pv {
-        negamax(
-            searcher,
-            game,
-            depth - IID_REDUCTION,
-            ply,
-            alpha,
-            beta,
-            false,
-        );
-        if let Some((_, best)) = searcher.tt.probe(hash, alpha, beta, depth, ply) {
-            tt_move = best;
-        }
+    // Internal Iterative Reductions (IIR): if we have no TT move in an
+    // expected cut-node (Stockfish-style cutNode: non-PV, beta == alpha+1),
+    // and we are not in check, reduce depth slightly. The idea is that the
+    // node is likely unimportant if no best move was stored previously.
+    let cut_node = !is_pv && beta == alpha + 1;
+    if tt_move.is_none() && cut_node && !in_check && depth >= 4 {
+        depth -= 1;
     }
 
     // Pruning techniques (not in check, not PV node)
@@ -856,6 +925,13 @@ fn negamax(
             quiets_searched.push((m.piece.piece_type, idx));
         }
 
+        // For this node at `ply`, this move becomes the previous move for child
+        // ply + 1, stored as (from_hash, to_hash).
+        let prev_entry_backup = searcher.prev_move_stack[ply];
+        let from_hash = hash_move_from(m);
+        let to_hash = hash_move_dest(m);
+        searcher.prev_move_stack[ply] = (from_hash, to_hash);
+
         legal_moves += 1;
 
         let score;
@@ -936,6 +1012,9 @@ fn negamax(
 
         game.undo_move(m, undo);
 
+        // Restore previous-move stack entry for this ply after child returns.
+        searcher.prev_move_stack[ply] = prev_entry_backup;
+
         if searcher.stopped {
             return best_score;
         }
@@ -977,6 +1056,16 @@ fn negamax(
                 // Killer move heuristic (for non-captures)
                 searcher.killers[ply][1] = searcher.killers[ply][0].clone();
                 searcher.killers[ply][0] = Some(*m);
+
+                // Countermove heuristic: on a quiet beta cutoff, record this move
+                // as the countermove to the move that led into this node.
+                if ply > 0 {
+                    let (prev_from_hash, prev_to_hash) = searcher.prev_move_stack[ply - 1];
+                    if prev_from_hash < 256 && prev_to_hash < 256 {
+                        searcher.countermoves[prev_from_hash][prev_to_hash] =
+                            (m.piece.piece_type as u8, m.to.x as i16, m.to.y as i16);
+                    }
+                }
             } else if let Some(cap_type) = captured_type {
                 // Update capture history on beta cutoff
                 let bonus = (depth * depth) as i32;
