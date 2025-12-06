@@ -9,9 +9,15 @@
     "gen-dataset": "node gen_dataset.js",
     "tune": "node texel_tuner.js",
     "sprt-ci": "node run_sprt_ci.js",
-    "apply-tune": "node apply_tuned_params.js"
+    "apply-tune": "node apply_tuned_params.js",
+    "spsa": "node spsa.mjs"
   },
-  "keywords": ["chess", "engine", "sprt", "testing"],
+  "keywords": [
+    "chess",
+    "engine",
+    "sprt",
+    "testing"
+  ],
   "dependencies": {
     "puppeteer": "^22.0.0"
   }

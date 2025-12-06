@@ -3,17 +3,11 @@ use crate::game::GameState;
 use crate::moves::Move;
 use crate::search::static_exchange_eval;
 
+use super::params::{
+    see_winning_threshold, sort_countermove, sort_hash, sort_killer1, sort_killer2,
+    sort_winning_capture, DEFAULT_SORT_LOSING_CAPTURE, DEFAULT_SORT_QUIET,
+};
 use super::Searcher;
-
-// Zig-style move ordering constants (scaled for our key direction where
-// lower scores are searched first).
-const SORT_HASH: i32 = 6_000_000;
-const SORT_WINNING_CAPTURE: i32 = 1_000_000;
-const SORT_LOSING_CAPTURE: i32 = 0;
-const SORT_QUIET: i32 = 0;
-const SORT_KILLER1: i32 = 900_000;
-const SORT_KILLER2: i32 = 800_000;
-const SORT_COUNTERMOVE: i32 = 600_000;
 
 // Move ordering helpers
 pub fn sort_moves(
@@ -37,7 +31,7 @@ pub fn sort_moves(
         // Hash move bonus
         if let Some(ttm) = tt_move {
             if m.from == ttm.from && m.to == ttm.to && m.promotion == ttm.promotion {
-                score += SORT_HASH;
+                score += sort_hash();
             }
         }
 
@@ -50,13 +44,13 @@ pub fn sort_moves(
             // Approximate Zig's see_threshold(pos, move, -90): treat captures
             // that lose more than ~a pawn as "losing" and others as winning.
             let see_gain = static_exchange_eval(game, m);
-            let is_winning = see_gain >= -90;
+            let is_winning = see_gain >= see_winning_threshold();
 
             score += mvv_lva;
             if is_winning {
-                score += SORT_WINNING_CAPTURE;
+                score += sort_winning_capture();
             } else {
-                score += SORT_LOSING_CAPTURE;
+                score += DEFAULT_SORT_LOSING_CAPTURE;
             }
 
             let cap_hist =
@@ -67,11 +61,11 @@ pub fn sort_moves(
             if searcher.killers[ply][0].as_ref().map_or(false, |k| {
                 m.from == k.from && m.to == k.to && m.promotion == k.promotion
             }) {
-                score += SORT_KILLER1;
+                score += sort_killer1();
             } else if searcher.killers[ply][1].as_ref().map_or(false, |k| {
                 m.from == k.from && m.to == k.to && m.promotion == k.promotion
             }) {
-                score += SORT_KILLER2;
+                score += sort_killer2();
             } else {
                 // Check if this is the countermove for the previous move
                 if ply > 0 && prev_from_hash < 256 && prev_to_hash < 256 {
@@ -82,10 +76,10 @@ pub fn sort_moves(
                         && cm_to_x == m.to.x as i16
                         && cm_to_y == m.to.y as i16
                     {
-                        score += SORT_COUNTERMOVE;
+                        score += sort_countermove();
                     }
                 }
-                score += SORT_QUIET;
+                score += DEFAULT_SORT_QUIET;
 
                 // Main history heuristic
                 let idx = hash_move_dest(m);

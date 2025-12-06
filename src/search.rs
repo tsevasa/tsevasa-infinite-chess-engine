@@ -21,39 +21,16 @@ pub const MATE_VALUE: i32 = 900_000;
 pub const MATE_SCORE: i32 = 800_000;
 pub const THINK_TIME_MS: u128 = 3000; // 3 seconds per move (default, may be overridden by caller)
 
-// Small penalty for drawing by threefold repetition from the side to move's
-// perspective. This discourages pointless repetitions when equal or better
-// continuations exist, but is small enough that the engine will still accept
-// a draw in worse positions.
-const REPETITION_PENALTY: i32 = 8;
-
-// Maximum absolute value for history scores (used by gravity-style updates)
-const MAX_HISTORY: i32 = 4000;
-
-// Null Move Pruning parameters
-const NMP_REDUCTION: usize = 3;
-const NMP_MIN_DEPTH: usize = 3;
-
-// Late Move Reduction parameters
-const LMR_MIN_DEPTH: usize = 3;
-const LMR_MIN_MOVES: usize = 4;
-
-// History Leaf Pruning (Fruit-style) parameters
-// Only active in non-PV, shallow nodes to keep it conservative but effective.
-const HLP_MAX_DEPTH: usize = 3; // only apply at depth <= 3
-const HLP_MIN_MOVES: usize = 5; // played_nb >= 5
-const HLP_HISTORY_REDUCE: i32 = 300; // history < this gets extra reduction
-const HLP_HISTORY_LEAF: i32 = 0; // and if depth<=0 and history < this, prune move
-
-// Late Move Pruning thresholds per depth (skip quiet moves after this many moves searched)
-// Index is depth (0=unused, 1=depth1, etc). At depth d, skip after LMP_THRESHOLD[d] quiet moves.
-const LMP_THRESHOLD: [usize; 5] = [0, 4, 8, 12, 16];
-
-// Aspiration window
-const ASPIRATION_WINDOW: i32 = 50;
-
-// Futility pruning margins
-const FUTILITY_MARGIN: [i32; 4] = [0, 100, 200, 300];
+// ============================================================================
+// Tunable search parameters - accessed via param accessor functions
+// ============================================================================
+pub mod params;
+use params::{
+    aspiration_fail_mult, aspiration_window, futility_margin, history_bonus_base,
+    history_bonus_cap, history_bonus_sub, hlp_history_leaf, hlp_history_reduce, hlp_max_depth,
+    hlp_min_moves, lmp_threshold, lmr_divisor, lmr_min_depth, lmr_min_moves, max_history,
+    nmp_min_depth, nmp_reduction, repetition_penalty, rfp_margin_per_depth, rfp_max_depth,
+};
 
 mod tt;
 pub use tt::{TTEntry, TTFlag, TranspositionTable};
@@ -252,16 +229,17 @@ impl Searcher {
     /// Gravity-style history update: scales updates based on current value and clamps to [-MAX_HISTORY, MAX_HISTORY].
     #[inline]
     pub fn update_history(&mut self, piece: PieceType, idx: usize, bonus: i32) {
+        let max_h = max_history();
         let mut clamped = bonus;
-        if clamped > MAX_HISTORY {
-            clamped = MAX_HISTORY;
+        if clamped > max_h {
+            clamped = max_h;
         }
-        if clamped < -MAX_HISTORY {
-            clamped = -MAX_HISTORY;
+        if clamped < -max_h {
+            clamped = -max_h;
         }
 
         let entry = &mut self.history[piece as usize][idx];
-        *entry += clamped - *entry * clamped.abs() / MAX_HISTORY;
+        *entry += clamped - *entry * clamped.abs() / max_h;
     }
 
     #[inline]
@@ -427,9 +405,10 @@ pub fn get_best_move_timed_with_eval(
             negamax_root(&mut searcher, game, depth, -INFINITY, INFINITY)
         } else {
             // Aspiration window search
-            let mut alpha = searcher.prev_score - ASPIRATION_WINDOW;
-            let mut beta = searcher.prev_score + ASPIRATION_WINDOW;
-            let mut window_size = ASPIRATION_WINDOW;
+            let asp_win = aspiration_window();
+            let mut alpha = searcher.prev_score - asp_win;
+            let mut beta = searcher.prev_score + asp_win;
+            let mut window_size = asp_win;
             let mut result;
             let mut retries = 0;
 
@@ -443,11 +422,11 @@ pub fn get_best_move_timed_with_eval(
 
                 if result <= alpha {
                     // Failed low - widen alpha
-                    window_size *= 4;
+                    window_size *= aspiration_fail_mult();
                     alpha = searcher.prev_score - window_size;
                 } else if result >= beta {
                     // Failed high - widen beta
-                    window_size *= 4;
+                    window_size *= aspiration_fail_mult();
                     beta = searcher.prev_score + window_size;
                 } else {
                     // Score within window
@@ -503,7 +482,7 @@ pub fn get_best_move_timed_with_eval(
                     factor = 0.5;
                 }
 
-                if has_prev_iter_score && best_score - prev_iter_score > ASPIRATION_WINDOW {
+                if has_prev_iter_score && best_score - prev_iter_score > aspiration_window() {
                     factor *= 1.1;
                 }
 
@@ -760,7 +739,7 @@ fn negamax(
         // from the current side's perspective. This nudges the search away
         // from pointless threefolds when other equal moves exist, while still
         // allowing repetition in clearly worse positions.
-        return -REPETITION_PENALTY;
+        return -repetition_penalty();
     }
 
     // Mate distance pruning (not at root)
@@ -835,12 +814,12 @@ fn negamax(
     // Pruning techniques (not in check, not PV node)
     if !in_check && !is_pv {
         // Reverse Futility Pruning (Static Null Move Pruning)
-        if depth < 3 && static_eval - 120 * depth as i32 >= beta {
+        if depth < rfp_max_depth() && static_eval - rfp_margin_per_depth() * depth as i32 >= beta {
             return static_eval;
         }
 
         // Null Move Pruning
-        if allow_null && depth >= NMP_MIN_DEPTH && static_eval >= beta {
+        if allow_null && depth >= nmp_min_depth() && static_eval >= beta {
             // Check if we have non-pawn material (avoid zugzwang)
             let has_pieces = game.board.pieces.iter().any(|(_, p)| {
                 p.color == game.turn
@@ -853,7 +832,7 @@ fn negamax(
                 let saved_ep = game.en_passant.clone();
                 game.make_null_move();
 
-                let r = NMP_REDUCTION + depth / 6;
+                let r = nmp_reduction() + depth / 6;
                 let null_score = -negamax(
                     searcher,
                     game,
@@ -896,7 +875,7 @@ fn negamax(
     // Futility pruning flag
     let futility_pruning = !in_check && !is_pv && depth <= 3;
     let futility_base = if futility_pruning {
-        static_eval + FUTILITY_MARGIN[depth.min(3)]
+        static_eval + futility_margin(depth)
     } else {
         0
     };
@@ -917,7 +896,7 @@ fn negamax(
         // Late Move Pruning (LMP) - skip quiet moves late in the move list at shallow depths
         // Only prune after we have at least one legal move (best_score != -INFINITY)
         if !in_check && !is_pv && depth <= 4 && depth > 0 && !is_capture && !is_promotion {
-            let threshold = LMP_THRESHOLD[depth.min(4)];
+            let threshold = lmp_threshold(depth);
             if legal_moves >= threshold && best_score > -MATE_SCORE {
                 continue;
             }
@@ -958,9 +937,14 @@ fn negamax(
         } else {
             // Late Move Reductions
             let mut reduction = 0;
-            if depth >= LMR_MIN_DEPTH && legal_moves >= LMR_MIN_MOVES && !in_check && !is_capture {
-                reduction =
-                    1 + (legal_moves as f32).ln() as usize * (depth as f32).ln() as usize / 3;
+            if depth >= lmr_min_depth()
+                && legal_moves >= lmr_min_moves()
+                && !in_check
+                && !is_capture
+            {
+                reduction = 1
+                    + (legal_moves as f32).ln() as usize * (depth as f32).ln() as usize
+                        / lmr_divisor();
 
                 // Reduce more when position is not improving
                 if !improving {
@@ -979,20 +963,20 @@ fn negamax(
                 && !is_pv
                 && !is_capture
                 && !is_promotion
-                && depth <= HLP_MAX_DEPTH
-                && legal_moves >= HLP_MIN_MOVES
+                && depth <= hlp_max_depth()
+                && legal_moves >= hlp_min_moves()
                 && best_score > -MATE_SCORE
             {
                 let idx = hash_move_dest(m);
                 let value = searcher.history[m.piece.piece_type as usize][idx];
 
-                if value < HLP_HISTORY_REDUCE {
+                if value < hlp_history_reduce() {
                     // Extra reduction based on poor history
                     new_depth -= 1;
 
                     // If depth after reductions would drop to quiescence or below
                     // and history is really bad, prune this move entirely.
-                    if new_depth <= 0 && value < HLP_HISTORY_LEAF {
+                    if new_depth <= 0 && value < hlp_history_leaf() {
                         game.undo_move(m, undo);
                         continue;
                     }
@@ -1062,9 +1046,9 @@ fn negamax(
             if !is_capture {
                 // History bonus for quiet cutoff move, with maluses for previously searched quiets
                 let idx = hash_move_dest(m);
-                let bonus = 300 * depth as i32 - 250;
-                let adj = bonus.min(1536);
-                let max_history: i32 = 16384;
+                let bonus = history_bonus_base() * depth as i32 - history_bonus_sub();
+                let adj = bonus.min(history_bonus_cap());
+                let max_history: i32 = params::DEFAULT_HISTORY_MAX_GRAVITY;
 
                 searcher.update_history(m.piece.piece_type, idx, bonus);
 

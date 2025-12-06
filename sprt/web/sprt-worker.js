@@ -19,17 +19,17 @@ function getVariantPosition(variantName, clock = null) {
     const variantData = getVariantData(variantName);
     const pieces = [];
     const special_rights = []; // Build dynamically from '+' suffix
-    
+
     // Parse ICN position string into pieces array
     for (const pieceStr of variantData.position.split('|')) {
         if (!pieceStr) continue;
-        
+
         const parts = pieceStr.split(',');
         if (parts.length !== 2) continue;
-        
+
         const pieceInfo = parts[0];
         const yStr = parts[1];
-        
+
         if (!pieceInfo) continue;
 
         // Split pieceInfo into a variable-length piece code and numeric x coordinate.
@@ -59,13 +59,13 @@ function getVariantPosition(variantName, clock = null) {
         const hasSpecialRights = xRaw.endsWith('+') || yStr.endsWith('+');
         const x = xRaw.endsWith('+') ? xRaw.slice(0, -1) : xRaw;
         const y = yStr.endsWith('+') ? yStr.slice(0, -1) : yStr;
-        
+
         // Validate coordinates are valid numbers (allow negative and multi-digit)
         if (isNaN(parseInt(x, 10)) || isNaN(parseInt(y, 10))) {
             console.warn(`Invalid coordinates in ICN: ${pieceStr} -> x:${x}, y:${y}`);
             continue;
         }
-        
+
         // Add to special_rights array if this piece has special rights
         if (hasSpecialRights) {
             special_rights.push(`${x},${y}`);
@@ -426,7 +426,7 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove,
         // state (clocks, en passant, special rights) by replaying moves.
         const gameInput = clonePosition(startPosition);
         gameInput.move_history = moveHistory.slice();
-        
+
         // Include clock info in the game state so the engine can manage its own time
         if (haveClocks) {
             gameInput.clock = {
@@ -449,7 +449,7 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove,
         let flaggedOnTime = false;
         const engine = new EngineClass(gameInput);
         const startMs = haveClocks ? nowMs() : 0;
-        
+
         // Safety check: if clock time is already zero or negative, flag timeout immediately
         if (haveClocks) {
             const currentClock = isWhiteTurn ? whiteClock : blackClock;
@@ -467,7 +467,7 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove,
                 };
             }
         }
-        
+
         const move = engine.get_best_move_with_time(haveClocks ? 0 : searchTimeMs);
         engine.free();
         if (haveClocks) {
@@ -673,12 +673,23 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove,
     return { result: 'draw', log: moveLines.join('\n'), samples: texelSamples };
 }
 
+// Per-game timeout to prevent hangs
+const GAME_TIMEOUT_MS = 90000; // 90 seconds max per game
+
+function withTimeout(promise, ms, fallbackValue) {
+    return Promise.race([
+        promise,
+        new Promise((resolve) => setTimeout(() => resolve(fallbackValue), ms))
+    ]);
+}
+
 self.onmessage = async (e) => {
     const msg = e.data;
     if (msg.type === 'runGame') {
         try {
             await ensureInit();
-            const { result, log, reason, materialThreshold, samples } = await playSingleGame(
+
+            const gamePromise = playSingleGame(
                 msg.timePerMove,
                 msg.maxMoves,
                 msg.newPlaysWhite,
@@ -687,8 +698,19 @@ self.onmessage = async (e) => {
                 msg.baseTimeMs,
                 msg.incrementMs,
                 msg.timeControl,
-                msg.variantName || 'Classical', // Default to Classical if not specified
+                msg.variantName || 'Classical',
             );
+
+            // Timeout wrapper - treat timeout as draw
+            const gameResult = await withTimeout(gamePromise, GAME_TIMEOUT_MS, {
+                result: 'draw',
+                log: '# Game timed out after ' + GAME_TIMEOUT_MS + 'ms',
+                reason: 'timeout',
+                samples: []
+            });
+
+            const { result, log, reason, materialThreshold, samples } = gameResult;
+
             self.postMessage({
                 type: 'result',
                 gameIndex: msg.gameIndex,

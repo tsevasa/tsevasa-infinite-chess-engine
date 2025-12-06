@@ -163,6 +163,19 @@ Features:
 
 See [sprt/README.md](sprt/README.md) for full documentation and screenshots.
 
+### SPSA Parameter Tuning
+
+The project also includes an SPSA (Simultaneous Perturbation Stochastic Approximation) tuner for automatic parameter optimization.
+
+```bash
+cd sprt
+npm run spsa
+```
+
+This will run a self-tuning loop to optimize search parameters like reductions, pruning margins, and history bonuses. It runs games between the base parameters and perturbed versions, updating the parameters based on the results.
+
+See [sprt/README.md#spsa-logic-tuning](sprt/README.md#spsa-logic-tuning) for full usage instructions.
+
 ## Project Structure
 
 ```
@@ -176,7 +189,11 @@ hydrochess-wasm/
 │   ├── search/         # Search internals (TT, move ordering, helpers)
 │   │   ├── tt.rs       # Transposition table implementation
 │   │   └── ordering.rs # Move ordering heuristics
-│   ├── evaluation.rs   # Position evaluation
+│   ├── evaluation/     # Position evaluation
+│   │   ├── mod.rs      # Evaluation entry point
+│   │   ├── base.rs     # Base evaluation logic and terms
+│   │   ├── pieces.rs   # Piece-specific valuation
+│   │   └── variants/   # Variant-specific logic
 │   └── utils.rs        # Utilities and panic hook
 ├── sprt/               # SPRT testing helper + web UI
 │   ├── sprt.js         # Web helper: builds web WASM & serves sprt/web

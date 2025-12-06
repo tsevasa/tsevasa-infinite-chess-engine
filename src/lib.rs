@@ -422,6 +422,23 @@ impl Engine {
         serde_wasm_bindgen::to_value(&JsEvalWithFeatures { eval, features }).unwrap()
     }
 
+    /// Set search parameters from a JSON string.
+    /// Only available when the `search_tuning` feature is enabled.
+    /// Returns true on success, false on parse failure.
+    #[cfg(feature = "search_tuning")]
+    #[wasm_bindgen]
+    pub fn set_search_params(&self, json: &str) -> bool {
+        crate::search::params::set_search_params_from_json(json)
+    }
+
+    /// Get current search parameters as a JSON string.
+    /// Only available when the `search_tuning` feature is enabled.
+    #[cfg(feature = "search_tuning")]
+    #[wasm_bindgen]
+    pub fn get_search_params(&self) -> String {
+        crate::search::params::get_search_params_as_json()
+    }
+
     /// Return the engine's static evaluation of the current position in centipawns,
     /// from the side-to-move's perspective (positive = advantage for side to move).
     pub fn evaluate_position(&mut self) -> i32 {

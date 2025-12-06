@@ -192,6 +192,61 @@ sprt/
 └── package.json     # Local package with npm scripts
 ```
 
+## SPSA Logic Tuning
+
+The directory also contains an SPSA (Simultaneous Perturbation Stochastic Approximation) tuner for optimizing search parameters. This tool runs self-play games to automatically tune constants like reductions, pruning margins, and history bonuses.
+
+### Quick Start
+
+```bash
+# Run the tuner with default settings (auto-resumes if checkpoint exists)
+npm run spsa
+```
+
+### Usage Guide
+
+The tuner runs iterations of games to optimize parameters defined in `spsa_config.mjs`.
+
+**Common Options:**
+
+- `--games <n>`: Number of games per side per iteration. Higher = more accurate gradient but slower. (Default: 60)
+- `--iterations <n>`: How many iterations to run. (Default: 100)
+- `--tc <ms>`: Time control per move in milliseconds. (Default: 200)
+- `--concurrency <n>`: Number of parallel workers. (Default: 20)
+- `--fresh`: Ignore existing checkpoints and start tuning from scratch.
+- `--verbose`: Show detailed parameter updates and debug info.
+
+**Examples:**
+
+```bash
+# Faster run with fewer games per iteration
+npm run spsa -- --games 20 --tc 25
+
+# Start fresh with high concurrency
+npm run spsa -- --fresh --concurrency 20
+
+# Run for many iterations
+npm run spsa -- --iterations 1000
+```
+
+### Checkpoints and Resuming
+
+- Checkpoints are saved to `sprt/checkpoints/spsa_N.json`.
+- By default, checkpoints are saved every **5% of total iterations** (e.g., every 5 iterations for a 100-iteration run).
+- You can change this frequency with `--checkpoint <n>`.
+- `npm run spsa` will **automatically find the latest checkpoint** and resume from it.
+- Use `--fresh` to force a new run from default parameters.
+- You can also resume from a specific file if needed: 
+  ```bash
+  npm run spsa -- checkpoints/spsa_50.json
+  ```
+
+### Configuration
+
+Editable parameters and their bounds are defined in `sprt/spsa_config.mjs`. This file also controls the SPSA hyperparameters (learning rate `a`, perturbation size `c`, stability constant `A`, etc.).
+
+---
+
 ## References
 
 - [SPRT on Chess Programming Wiki](https://www.chessprogramming.org/Sequential_Probability_Ratio_Test)
