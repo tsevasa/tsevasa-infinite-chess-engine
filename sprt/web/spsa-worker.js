@@ -264,7 +264,7 @@ async function playSingleGame(thetaPlus, thetaMinus, plusPlaysWhite, timePerMove
 // Worker Message Handler
 // ============================================================================
 
-const GAME_TIMEOUT_MS = 60000; // 60 seconds max per game
+// function withTimeout is below
 
 function withTimeout(promise, ms, fallbackValue) {
     return Promise.race([
@@ -297,7 +297,9 @@ self.onmessage = async (e) => {
             );
 
             // Timeout wrapper - treat timeout as draw
-            const result = await withTimeout(gamePromise, GAME_TIMEOUT_MS, 'draw');
+            // Scale timeout with thinking time: 100ms -> 60s (ratio 600)
+            const timeoutMs = msg.timePerMove * 600;
+            const result = await withTimeout(gamePromise, timeoutMs, 'draw');
 
             self.postMessage({
                 type: 'result',
