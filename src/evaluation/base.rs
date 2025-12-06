@@ -156,6 +156,28 @@ const DOUBLED_PAWN_PENALTY: i32 = 8;
 const BISHOP_PAIR_BONUS: i32 = 60;
 const QUEEN_IDEAL_LINE_DIST: i32 = 4;
 
+// ==================== Fairy Piece Evaluation ====================
+
+// Leaper positioning (tropism to kings and piece cloud)
+const LEAPER_TROPISM_DIVISOR: i32 = 400; // piece_value / 400 = tropism multiplier
+const LEAPER_MAX_TROPISM_DIST: i64 = 20; // Beyond this, bonus is capped
+
+// Compound piece weight scaling (fraction of base piece eval to inherit)
+const CHANCELLOR_ROOK_SCALE: i32 = 90; // 90% of rook eval
+const ARCHBISHOP_BISHOP_SCALE: i32 = 90; // 90% of bishop eval
+const AMAZON_ROOK_SCALE: i32 = 50; // 50% of rook eval (also has queen)
+const AMAZON_QUEEN_SCALE: i32 = 70; // 70% of queen eval
+
+// Knightrider specific
+const KNIGHTRIDER_RAY_BONUS: i32 = 3; // Per square of knight-ray mobility
+
+// ==================== Pawn Distance Scaling ====================
+
+// Pawns far from promotion are worth less
+const PAWN_FULL_VALUE_THRESHOLD: i64 = 8; // Within 8 ranks = full value
+const PAWN_DISTANCE_PENALTY_PER_RANK: i32 = 5; // -5cp per rank beyond threshold
+const PAWN_MIN_VALUE_FRACTION: i32 = 40; // Never penalize below 40% of base (40cp)
+
 /// Compute the centroid of all non-obstacle, non-void pieces on the board.
 /// Used for piece cloud calculations. (Made public for variant modules.)
 pub fn compute_cloud_center(board: &Board) -> Option<Coordinate> {
@@ -237,18 +259,6 @@ pub fn evaluate(game: &GameState) -> i32 {
     }
 }
 
-/// Fast evaluation for use in quiescence - just material + basic positional
-#[allow(dead_code)]
-pub fn evaluate_fast(game: &GameState) -> i32 {
-    let score = game.material_score;
-
-    if game.turn == PlayerColor::Black {
-        -score
-    } else {
-        score
-    }
-}
-
 // ==================== Piece Evaluation ====================
 
 pub fn evaluate_pieces(
@@ -295,6 +305,93 @@ pub fn evaluate_pieces(
             PieceType::Pawn => {
                 evaluate_pawn_position(*x, *y, piece.color, white_promo_rank, black_promo_rank)
             }
+
+            // ===== Fairy Pieces =====
+
+            // Chancellor (R+N): Inherit rook logic scaled
+            PieceType::Chancellor => {
+                let rook_eval = evaluate_rook(game, *x, *y, piece.color, white_king, black_king);
+                let knight_eval = evaluate_knight(*x, *y, piece.color, black_king, white_king);
+                (rook_eval * CHANCELLOR_ROOK_SCALE / 100) + (knight_eval / 2)
+            }
+
+            // Archbishop (B+N): Inherit bishop logic scaled
+            PieceType::Archbishop => {
+                let bishop_eval =
+                    evaluate_bishop(game, *x, *y, piece.color, white_king, black_king);
+                let knight_eval = evaluate_knight(*x, *y, piece.color, black_king, white_king);
+                (bishop_eval * ARCHBISHOP_BISHOP_SCALE / 100) + (knight_eval / 2)
+            }
+
+            // Amazon (Q+N): Inherit both queen and rook logic
+            PieceType::Amazon => {
+                let queen_eval = evaluate_queen(game, *x, *y, piece.color, white_king, black_king);
+                let rook_eval = evaluate_rook(game, *x, *y, piece.color, white_king, black_king);
+                (queen_eval * AMAZON_QUEEN_SCALE / 100) + (rook_eval * AMAZON_ROOK_SCALE / 100)
+            }
+
+            // RoyalQueen: Same as queen
+            PieceType::RoyalQueen => {
+                evaluate_queen(game, *x, *y, piece.color, white_king, black_king)
+            }
+
+            // Knightrider: Knight-ray mobility
+            PieceType::Knightrider => {
+                evaluate_knightrider(*x, *y, piece.color, white_king, black_king, &game.board)
+            }
+
+            // Leapers (Hawk, Rose, Camel, Giraffe, Zebra, Centaur): Tropism-based positioning
+            PieceType::Hawk
+            | PieceType::Rose
+            | PieceType::Camel
+            | PieceType::Giraffe
+            | PieceType::Zebra => evaluate_leaper_positioning(
+                *x,
+                *y,
+                piece.color,
+                white_king,
+                black_king,
+                cloud_center.as_ref(),
+                get_piece_value(piece.piece_type),
+            ),
+
+            // Centaur / RoyalCentaur: Knight + King movement, use knight eval + leaper positioning
+            PieceType::Centaur | PieceType::RoyalCentaur => {
+                let knight_eval = evaluate_knight(*x, *y, piece.color, black_king, white_king);
+                let leaper_eval = evaluate_leaper_positioning(
+                    *x,
+                    *y,
+                    piece.color,
+                    white_king,
+                    black_king,
+                    cloud_center.as_ref(),
+                    get_piece_value(piece.piece_type),
+                );
+                (knight_eval * 80 / 100) + leaper_eval
+            }
+
+            // Huygen: Prime-distance slider, use tropism
+            PieceType::Huygen => evaluate_leaper_positioning(
+                *x,
+                *y,
+                piece.color,
+                white_king,
+                black_king,
+                cloud_center.as_ref(),
+                get_piece_value(PieceType::Huygen),
+            ),
+
+            // Guard: King-like, positional
+            PieceType::Guard => evaluate_leaper_positioning(
+                *x,
+                *y,
+                piece.color,
+                white_king,
+                black_king,
+                cloud_center.as_ref(),
+                get_piece_value(PieceType::Guard),
+            ),
+
             _ => 0,
         };
 
@@ -706,11 +803,27 @@ pub fn evaluate_pawn_position(
     match color {
         PlayerColor::White => {
             let dist = (white_promo_rank - y).max(0);
+            // Advancement bonus (within 8 ranks)
             bonus += ((8 - dist.min(8)) as i32) * 3;
+
+            // Distance penalty for pawns far from promotion (beyond 8 ranks)
+            if dist > PAWN_FULL_VALUE_THRESHOLD {
+                let extra_dist = (dist - PAWN_FULL_VALUE_THRESHOLD) as i32;
+                let penalty = (extra_dist * PAWN_DISTANCE_PENALTY_PER_RANK).min(60);
+                bonus -= penalty;
+            }
         }
         PlayerColor::Black => {
             let dist = (y - black_promo_rank).max(0);
+            // Advancement bonus (within 8 ranks)
             bonus += ((8 - dist.min(8)) as i32) * 3;
+
+            // Distance penalty for pawns far from promotion (beyond 8 ranks)
+            if dist > PAWN_FULL_VALUE_THRESHOLD {
+                let extra_dist = (dist - PAWN_FULL_VALUE_THRESHOLD) as i32;
+                let penalty = (extra_dist * PAWN_DISTANCE_PENALTY_PER_RANK).min(60);
+                bonus -= penalty;
+            }
         }
         PlayerColor::Neutral => {}
     }
@@ -718,6 +831,132 @@ pub fn evaluate_pawn_position(
     // Central pawns are valuable
     if x >= 3 && x <= 5 {
         bonus += 5;
+    }
+
+    bonus
+}
+
+// ==================== Fairy Piece Evaluation ====================
+
+/// Evaluate leaper pieces (Hawk, Rose, Camel, Giraffe, Zebra, etc.)
+/// Uses tropism (distance to kings) and cloud proximity since mobility is meaningless on infinite board
+fn evaluate_leaper_positioning(
+    x: i64,
+    y: i64,
+    color: PlayerColor,
+    white_king: &Option<Coordinate>,
+    black_king: &Option<Coordinate>,
+    cloud_center: Option<&Coordinate>,
+    piece_value: i32,
+) -> i32 {
+    let mut bonus: i32 = 0;
+
+    // Scale factor based on piece value (stronger pieces get bigger positioning bonuses)
+    let scale = (piece_value / LEAPER_TROPISM_DIVISOR).max(1);
+
+    // Tropism: reward being close to enemy king
+    let enemy_king = if color == PlayerColor::White {
+        black_king
+    } else {
+        white_king
+    };
+    if let Some(ek) = enemy_king {
+        let dist = (x - ek.x).abs().max((y - ek.y).abs()); // Chebyshev distance
+        let capped_dist = dist.min(LEAPER_MAX_TROPISM_DIST);
+        let tropism_bonus = (LEAPER_MAX_TROPISM_DIST - capped_dist) as i32;
+        bonus += tropism_bonus * scale;
+    }
+
+    // Reward being close to own king (defensive potential)
+    let own_king = if color == PlayerColor::White {
+        white_king
+    } else {
+        black_king
+    };
+    if let Some(ok) = own_king {
+        let dist = (x - ok.x).abs().max((y - ok.y).abs());
+        if dist <= 4 {
+            bonus += (5 - dist as i32) * (scale / 2).max(1);
+        }
+    }
+
+    // Reward being close to piece cloud center (activity)
+    if let Some(center) = cloud_center {
+        let dist = (x - center.x).abs().max((y - center.y).abs());
+        if dist <= 10 {
+            bonus += (11 - dist as i32) * (scale / 3).max(1);
+        }
+    }
+
+    bonus
+}
+
+/// Evaluate knightrider (extended knight that can continue in knight patterns)
+fn evaluate_knightrider(
+    x: i64,
+    y: i64,
+    color: PlayerColor,
+    white_king: &Option<Coordinate>,
+    black_king: &Option<Coordinate>,
+    board: &Board,
+) -> i32 {
+    let mut bonus: i32 = 0;
+
+    // Knight offsets for all 8 directions
+    const KNIGHT_DIRS: [(i64, i64); 8] = [
+        (1, 2),
+        (2, 1),
+        (2, -1),
+        (1, -2),
+        (-1, -2),
+        (-2, -1),
+        (-2, 1),
+        (-1, 2),
+    ];
+
+    // Count how far the knightrider can travel in each direction
+    let mut total_reach = 0;
+    for (dx, dy) in KNIGHT_DIRS {
+        let mut nx = x + dx;
+        let mut ny = y + dy;
+        let mut steps = 0;
+        // Count empty squares along the knight-ray (max 5 steps for efficiency)
+        while steps < 5 {
+            if board.get_piece(&nx, &ny).is_some() {
+                break;
+            }
+            steps += 1;
+            nx += dx;
+            ny += dy;
+        }
+        total_reach += steps;
+    }
+    bonus += total_reach * KNIGHTRIDER_RAY_BONUS;
+
+    // Tropism to enemy king
+    let enemy_king = if color == PlayerColor::White {
+        black_king
+    } else {
+        white_king
+    };
+    if let Some(ek) = enemy_king {
+        let dist = (x - ek.x).abs() + (y - ek.y).abs();
+        if dist <= 10 {
+            bonus += (11 - dist as i32) * 3;
+        }
+    }
+
+    // Near own king bonus
+    let own_king = if color == PlayerColor::White {
+        white_king
+    } else {
+        black_king
+    };
+    if let Some(ok) = own_king {
+        let dist = (x - ok.x).abs() + (y - ok.y).abs();
+        if dist <= 5 {
+            bonus += KNIGHT_NEAR_KING_BONUS;
+        }
     }
 
     bonus
@@ -894,7 +1133,7 @@ fn evaluate_king_shelter(game: &GameState, king: &Coordinate, color: PlayerColor
 
 // ==================== Pawn Structure ====================
 
-fn evaluate_pawn_structure(game: &GameState) -> i32 {
+pub fn evaluate_pawn_structure(game: &GameState) -> i32 {
     let mut score: i32 = 0;
 
     // Track pawns per file for each color
