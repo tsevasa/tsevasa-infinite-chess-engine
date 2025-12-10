@@ -118,7 +118,7 @@ jobs:
         if: steps.check_parent.outputs.has_parent == 'true'
         working-directory: sprt
         env:
-          SPRT_CI_GAMES: "150"
+          SPRT_CI_GAMES: "200"
           SPRT_CI_CONCURRENCY: "10"
           SPRT_CI_TC: "5+0.05"
           SPRT_CI_TIMEOUT_MS: "1800000"

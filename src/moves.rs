@@ -1918,26 +1918,47 @@ fn generate_huygen_moves(
 
             let mut found_via_indices = false;
 
-            // Fallback mode: ignore spatial indices alignment optimization for short range.
+            // Fallback mode: scan step-by-step but still respect prime distance requirement.
             if fallback {
-                for dist in 1..=FALLBACK_LIMIT {
-                    let tx = from.x + dir_x * dist;
-                    let ty = from.y + dir_y * dist;
+                const PRIMES: [i64; 4] = [2, 3, 5, 7];
 
+                for &target_dist in &PRIMES {
+                    if target_dist > FALLBACK_LIMIT {
+                        break;
+                    }
+
+                    let tx = from.x + dir_x * target_dist;
+                    let ty = from.y + dir_y * target_dist;
+
+                    // Check if path is clear up to target_dist - 1
+                    let mut path_blocked = false;
+                    for step in 1..target_dist {
+                        let sx = from.x + dir_x * step;
+                        let sy = from.y + dir_y * step;
+                        if board.get_piece(&sx, &sy).is_some() {
+                            path_blocked = true;
+                            break;
+                        }
+                    }
+
+                    if path_blocked {
+                        break; // Can't reach any further primes in this direction
+                    }
+
+                    // Check target square
                     if let Some(target) = board.get_piece(&tx, &ty) {
-                        let is_enemy = target.color() != piece.color()
-                            && target.color() != PlayerColor::Neutral;
-
-                        // Original logic treats Void as "friendly" for capture purposes (stops at it, no capture)
+                        // Void blocks like friendly
                         if target.piece_type() == PieceType::Void {
                             break;
                         }
-
+                        let is_enemy = target.color() != piece.color()
+                            && target.color() != PlayerColor::Neutral;
                         if is_enemy {
                             moves.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
                         }
-                        break; // blocked
+                        break; // blocked at this prime, can't go further
                     } else {
+                        // Empty square at prime distance - valid move
                         moves.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
                     }
                 }
