@@ -132,6 +132,8 @@ struct JsGameRules {
     promotion_ranks: Option<JsPromotionRanks>,
     #[serde(default)]
     promotions_allowed: Option<Vec<String>>,
+    #[serde(default)]
+    move_rule: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -300,6 +302,7 @@ impl Engine {
                 promotion_ranks,
                 promotion_types: None,
                 promotions_allowed: js_rules.promotions_allowed,
+                move_rule_limit: js_rules.move_rule,
             };
             rules.init_promotion_types();
             rules
@@ -376,15 +379,9 @@ impl Engine {
         }
 
         if js_game.move_history.is_empty() {
-            // No history: trust JS clocks/turn/en-passant for this position
+            // No history: trust JS turn/en-passant for this position
             game.en_passant = parsed_en_passant;
             game.turn = js_turn;
-            game.halfmove_clock = js_game.halfmove_clock;
-            game.fullmove_number = if js_game.fullmove_number == 0 {
-                1
-            } else {
-                js_game.fullmove_number
-            };
         } else {
             // Replay the full move history from the start position.
             // Like UCI: just apply moves directly by coordinates, no legal move generation needed.
@@ -399,6 +396,15 @@ impl Engine {
             // After replay, GameState.turn, clocks, and en_passant have been
             // updated naturally by make_move_coords.
         }
+
+        // Always use the clocks passed from JS, as they reflect the authoritative state
+        // (e.g. edited counters in board editor, or simple synchronization).
+        game.halfmove_clock = js_game.halfmove_clock;
+        game.fullmove_number = if js_game.fullmove_number == 0 {
+            1
+        } else {
+            js_game.fullmove_number
+        };
 
         // Optional clock information (similar to UCI wtime/btime/winc/binc).
         let clock = js_game.clock;

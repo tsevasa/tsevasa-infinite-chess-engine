@@ -27,6 +27,7 @@ pub struct GameRules {
     #[serde(skip)]
     pub promotion_types: Option<Vec<PieceType>>, // Pre-converted promotion piece types (fast)
     pub promotions_allowed: Option<Vec<String>>, // Piece type codes (only for serialization)
+    pub move_rule_limit: Option<u32>,            // 50-move rule limit in halfmoves (default 100)
 }
 
 impl GameRules {
@@ -334,13 +335,13 @@ impl GameState {
         !white_has_non_king || !black_has_non_king
     }
 
-    /// Check if position is a draw by 50-move rule
+    /// Check if position is a draw by 50-move rule (or variant specific limit)
     pub fn is_fifty(&self) -> bool {
         // Don't check during null move search
         if self.null_moves > 0 {
             return false;
         }
-        self.halfmove_clock >= 100
+        self.halfmove_clock >= self.game_rules.move_rule_limit.unwrap_or(100)
     }
 
     /// Make a null move (just flip turn, for null move pruning)
